@@ -96,7 +96,8 @@ jobs:
         id: download_mfa
         uses: robinraju/release-downloader@v1
         with:
-          repository: SweetSmellFox/MFAAvalonia
+          # MFAAvalonia 已迁移到 MaaXYZ 组织（SweetSmellFox 会重定向，但写新的更清楚）
+          repository: MaaXYZ/MFAAvalonia
           fileName: "MFAAvalonia-*-${{ (matrix.os == 'win' && 'win') || (matrix.os == 'macos' && 'osx') || (matrix.os == 'linux' && 'linux') }}-${{ (matrix.arch == 'x86_64' && 'x64') || (matrix.arch == 'aarch64' && 'arm64') }}*"
           latest: ${{ env.MFAA_VERSION == '' }}
           tag: ${{ env.MFAA_VERSION }}
@@ -116,7 +117,16 @@ jobs:
         shell: bash
         run: |
           rm -rf MFA/runtimes
-      
+
+      # AgentServer 是个 Python 子进程。用户电脑上不一定装了 Python，
+      # 所以 Windows x64 包要自带一份便携版解释器 + maafw/numpy。
+      # 这一步跑在 ubuntu runner 上，脚本会用交叉安装去拉 Windows 轮子。
+      - name: Prepare embedded Python (win x86_64)
+        if: matrix.os == 'win' && matrix.arch == 'x86_64'
+        shell: bash
+        run: |
+          python tools/prepare_embedded_python.py
+
       - name: Install
         shell: bash
         run: |

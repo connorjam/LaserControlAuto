@@ -1,4 +1,405 @@
 {
+    // ==========================================================================
+    //  激光控制自动化 —— 参数扫描主流程
+    //
+    //  做什么：
+    //    1. 在 A 软件（Low_Noise_Drive_Debugger_V2.13.exe）里设置一个参数
+    //       ① OCR 找到 "Temperature" 这个词
+    //       ② 点它右边的输入框，填数值
+    //       ③ 点离这个词最近的 "Setting"
+    //    2. 等待 10 秒
+    //    3. 到 B 软件里图像识别，读出一个测量值
+    //    4. 把「设定参数 + 测量值」追加写入 CSV
+    //    5. 等待本次操作完毕，换下一个参数，回到第 1 步
+    //       参数区间 20 ~ 30，步长 1，共 11 组
+    //
+    //  自定义动作 / 识别实现在  agent/laser_sweep.py
+    //
+    //  ── 换成别的软件时要改什么 ───────────────────────────────────────────
+    //  A 软件（要操作的那个）：
+    //      ① 窗口标题 → assets/interface.json 的 win32.window_regex
+    //      ② 标签文字 → LaserSweepFindTemperature 的 anchor_text
+    //      ③ 偏移比例 → LaserSweepClickValueBox 的 dx_ratio
+    //    就这三样。**不需要再量任何 roi 坐标** —— 同名干扰项由「配对法」自动排除。
+    //
+    //  B 软件（要读数的那个）：
+    //      ① 窗口标题 → LaserSweepReadValueB 的 window_regex
+    //      ② 标签文字 → LaserSweepReadValueB 的 anchor_text
+    //    就这两样。**不需要量 roi**，靠「离标签最近的数值」自动定位。
+    //    DPI 也不用管：agent 会读 GetDpiForWindow 自己适配
+    //    （DPI 不感知的程序要用虚拟化坐标系截图，否则只能截到左上角 1/4）。
+    //  ───────────────────────────────────────────────────────────────────
+    //
+    //  ── 实测数据留档（本机 1331x720 截图空间，换软件后可作参照）───────────
+    //      · A 软件窗口标题       → Low Noise Driver Debugger V2.13（已写入 interface.json）
+    //      · "Temperature:" 位置  → (494, 293, 96, 16)，在 Module Config 面板
+    //      · 数值输入框           → 约 x 606~680；锚点中心 542 + 0.0736×1331 ≈ 640 ✓
+    //      · 三个 Setting 按钮    → (705,149) (704,216) (704,284)，Temperature 那行是最下面一个
+    //      · 干扰项（配对法自动排除）：
+    //          左侧状态栏还有 'Temperature'（距离²=450392，被淘汰），
+    //          右上标题是 'Settings'（带 s），PID Control 面板里还有第四个 'Setting'。
+    //      · B 软件 GaussianBeam  → 客户区 1440x829，"Wavelength" 的数值是 "1061 nm"
+    // ==========================================================================
+
+    // ---------- ① 初始化：生成参数序列 + 建 CSV 表头 ----------
+    "LaserSweepStart": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_begin",
+        "custom_action_param": {
+            // ⚠️ 这里的值是**默认值**。用户在通用 UI 的「扫描设置」里填的内容
+            //    会通过 interface.json 的 pipeline_override 整体替换掉这一块，
+            //    所以两边要改就一起改（字段名必须一致）。
+            "start": 20, // 扫描起始值
+            "end": 30, // 扫描结束值（含）
+            "step": 1, // 步长
+            "wait_sec": 10, // 每轮在 A 软件设好参数后等多久（秒）
+            // 结果文件夹。相对路径的基准是「interface.json 所在目录」：
+            //   开发时 → assets/output/laser_sweep_result.csv
+            //   打包后 → install/output/laser_sweep_result.csv
+            // 也可以填绝对路径，如 "D:\\数据"。
+            // 运行开始时会打印绝对路径，照着找就行。
+            "csv_dir": "./output",
+            "csv_header": ["序号", "设定参数", "B软件测量值", "时间"]
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepApplyParam"]
+    },
+
+    // ---------- ② 取本轮参数值，写进下面输入框节点的 input_text ----------
+    "LaserSweepApplyParam": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_apply_param",
+        "custom_action_param": {
+            "input_node": "LaserSweepTypeParam"
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepFindTemperature"]
+    },
+
+    // ---------- ③ 定位 "Temperature" 这个词 ----------
+    // 识别成功后，框架会把这个词的位置记为「本节点的识别位置」，
+    // 后面的节点就能用 target: "LaserSweepFindTemperature" 引用它。
+    //
+    // 这里用的是**配对法**而不是「OCR + 限定 roi」：
+    //   界面上有两个 Temperature（左侧状态栏一个、Module Config 面板一个），
+    //   原来的写法要靠写死 roi 把侧栏排除掉，窗口尺寸一变 roi 就失效。
+    //   现在改成「谁的最近邻是 Setting 按钮，就选谁」——
+    //   实测正确那个的距离²=41622，侧栏那个是 450392，差 11 倍，判定非常稳。
+    //   于是 roi 可以恢复成全屏 [0,0,0,0]，不用再量面板范围。
+    "LaserSweepFindTemperature": {
+        "recognition": "Custom",
+        "custom_recognition": "laser_find_nearest_setting",
+        "custom_recognition_param": {
+            // A 软件里那个参数的标签文字
+            "anchor_text": "Temperature",
+            // 用它来给多个同名标签「投票」：谁离按钮最近，谁才是真要操作的那一行
+            "target_text": "Setting",
+            // ★ 返回锚点本身（而不是按钮），后面的点击要拿它当基准
+            "return_box": "anchor",
+            "roi": [0, 0, 0, 0],
+            "ocr_node": "LaserSweepOcrSetting"
+        },
+        "action": "DoNothing",
+        "timeout": 15000,
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepClickValueBox"],
+        // 找不到这个词就没必要继续了，直接报错停下
+        "on_error": ["LaserSweepAbort"]
+    },
+
+    // ---------- ④ 点 "Temperature" 右侧的输入框 ----------
+    "LaserSweepClickValueBox": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_click_right_of",
+        // 锚点框从这里传进自定义动作（会落在 argv.box）
+        "target": "LaserSweepFindTemperature",
+        "custom_action_param": {
+            // 点击位置 = 锚点框中心 + 图像宽度 × dx_ratio
+            //
+            // 原来是 target_offset: [98, 0, 0, 0]，98 是照着 1331x720 那张截图
+            // 量出来的绝对像素，窗口尺寸一变就偏了。
+            // 98 / 1331 ≈ 0.0736，改成比例后分辨率怎么变都能跟得上。
+            //
+            // 实测：锚点框 (494,293,96,16)，中心 x = 494+48 = 542，
+            //       542 + 0.0736×1331 ≈ 640，正好落在输入框 x 606~680 内。
+            "dx_ratio": 0.0736,
+            "dy_ratio": 0.0
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 150,
+        "next": ["LaserSweepCaretToEnd"]
+    },
+
+    // ---------- ⑤ 清空输入框 ----------
+    // ⚠️ 这里刻意不使用 Ctrl+A，原因是踩过坑：
+    //    Win32 走 PostMessage 系列输入方式时，单独发 KeyDown(Ctrl) 再发 ClickKey(A)，
+    //    目标程序（Qt）拿不到 Ctrl 的按下状态 —— 结果全选没生效，反倒把字母 'a'
+    //    当成普通字符打了进去，于是每轮数值都往后拼接：
+    //        a200a2a281a30a27.a240a2200
+    //    改用「End 到行尾 + 连续 Backspace」就不依赖任何修饰键，稳得多。
+    "LaserSweepCaretToEnd": {
+        "recognition": "DirectHit",
+        "action": "ClickKey",
+        "key": 35, // VK_END，把光标移到输入框末尾
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 60,
+        "next": ["LaserSweepClearField"]
+    },
+    "LaserSweepClearField": {
+        "recognition": "DirectHit",
+        "action": "ClickKey",
+        "key": 8, // VK_BACK，退格
+        // 重复 32 次，足够清掉 32 个字符。
+        // 如果以后发现还有残留（比如手工填过很长的值），把 repeat 调大即可。
+        "repeat": 32,
+        "repeat_delay": 20,
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 80,
+        "next": ["LaserSweepTypeParam"]
+    },
+
+    // 【备选】如果你的框架版本够新、并且想改回 Ctrl+A：
+    //  agent 启动时会尽力声明「后台受管键」（见 agent/laser_sweep.py 的 _configure_controller），
+    //  声明成功后下面的三节点写法就能正常工作。需要时把 LaserSweepClickValueBox.next
+    //  改成 ["LaserSweepSelectAllDown"] 并取消整段注释即可。
+    // "LaserSweepSelectAllDown": {
+    //     "recognition": "DirectHit",
+    //     "action": "KeyDown",
+    //     "key": 17,
+    //     "auto_up": true,
+    //     "next": ["LaserSweepSelectAllPressA"]
+    // },
+    // "LaserSweepSelectAllPressA": {
+    //     "recognition": "DirectHit",
+    //     "action": "ClickKey",
+    //     "key": 65,
+    //     "next": ["LaserSweepSelectAllUp"]
+    // },
+    // "LaserSweepSelectAllUp": {
+    //     "recognition": "DirectHit",
+    //     "action": "KeyUp",
+    //     "key": 17,
+    //     "next": ["LaserSweepTypeParam"]
+    // },
+
+    // ---------- ⑥ 输入本轮参数值 ----------
+    "LaserSweepTypeParam": {
+        "recognition": "DirectHit",
+        "action": "InputText",
+        // 这里的 "20" 只是占位，运行期会被 LaserSweepApplyParam 动态覆盖成本轮的值
+        "input_text": "20",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 100,
+        "next": ["LaserSweepClickSetting"]
+    },
+
+    // 【可选】如果 A 软件必须按回车才把输入框内容提交上去，
+    //          就取消下面这段注释，并把 LaserSweepTypeParam.next 改成 ["LaserSweepCommitParam"]。
+    // "LaserSweepCommitParam": {
+    //     "recognition": "DirectHit",
+    //     "action": "ClickKey",
+    //     "key": 13, // VK_RETURN
+    //     "rate_limit": 0,
+    //     "pre_delay": 0,
+    //     "post_delay": 200,
+    //     "next": ["LaserSweepClickSetting"]
+    // },
+
+    // ---------- ⑦ 点离 "Temperature" 最近的那个 "Setting" ----------
+    // 识别到之后用 Click 点它自己（target 默认 true）
+    "LaserSweepClickSetting": {
+        "recognition": "Custom",
+        "custom_recognition": "laser_find_nearest_setting",
+        "custom_recognition_param": {
+            // 基准词：以它为圆心找最近的按钮
+            "anchor_text": "Temperature",
+            // 要点的按钮文字
+            "target_text": "Setting",
+            // ★ 这里要按钮本身，所以 return_box 用默认的 target
+            // 搜索范围用全屏：PID Control 面板里也有一个 Setting（x≈881），
+            // 左侧状态栏还有同名 "Temperature"，但配对法会自动选中距离最近的那一对，
+            // 所以**不需要再写死面板 roi**，窗口尺寸变了也不用改。
+            "roi": [0, 0, 0, 0],
+            // 复用的 OCR 子节点名
+            "ocr_node": "LaserSweepOcrSetting"
+        },
+        "action": "Click",
+        "timeout": 15000,
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 200,
+        "next": ["LaserSweepWaitSettle"],
+        "on_error": ["LaserSweepAbort"]
+    },
+
+    // OCR 子节点：不参与主流程，只被 laser_find_nearest_setting 通过 run_recognition 调用
+    "LaserSweepOcrSetting": {
+        "recognition": "OCR",
+        "roi": [0, 0, 0, 0],
+        "action": "DoNothing"
+    },
+
+    // ---------- ⑧ 等待 10 秒，让设备稳定下来 ----------
+    "LaserSweepWaitSettle": {
+        "recognition": "DirectHit",
+        "action": "DoNothing",
+        // 想改等待时长就改这里（单位毫秒）
+        "post_delay": 10000,
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "next": ["LaserSweepReadValueB"]
+    },
+
+    // ---------- ⑨ 读取 B 软件的测量值（自定义识别）----------
+    "LaserSweepReadValueB": {
+        "recognition": "Custom",
+        "custom_recognition": "laser_read_value_b",
+        "custom_recognition_param": {
+            // "fixed" = 不真的识别，每轮返回固定占位值（没有 B 软件时用）
+            // "ocr"   = 去 B 软件里真实识别
+            "mode": "ocr",
+            "fixed_value": 0.0,
+
+            // ===== B 软件窗口标题（正则）=====
+            // 填了它，agent 会用 ctypes 直接抓 B 窗口的画面，
+            // 不受「主控制器只绑定 A 窗口」的限制。留空则退回用主控制器的截图（也就是 A 的画面）。
+            //
+            // 为什么不是用 Win32Controller：
+            //   MaaAgentServer.dll 里的 MaaWin32ControllerCreate 是个空壳，会报
+            //   "MaaAgentServer Not implement this API" 并返回空句柄，
+            //   所以 agent 进程里建不了第二个控制器，只能自己走 GDI 截图。
+            //
+            // ⚠️ 一定要用 ^...$ 锚定。GaussianBeam 主窗口的标题就是 "GaussianBeam"，
+            //    但资源管理器窗口的标题是 "GaussianBeam - 文件资源管理器"，
+            //    不加锚点两个都会被匹配上。
+            "window_regex": "^GaussianBeam$",
+            // 命中多个窗口时取第几个
+            "window_index": 0,
+
+            // ===== 要找的标签词 =====
+            // 设了它，就会在所有识别到的数字里，挑**离这个词最近**的那个。
+            // GaussianBeam 里 "Wavelength" 正下方就是它的数值 "1061 nm"。
+            // 留空的话退化成「取第一个含数字的结果」。
+            "anchor_text": "Wavelength",
+
+            // ===== 识别区域 [x, y, w, h]，[0,0,0,0] = 全屏 =====
+            // 坐标空间 = B 窗口**客户区**的原始像素（不含标题栏）。
+            // 注意这和 A 软件不同：A 走框架截图，会被缩放到短边 720；
+            // B 是我们自己截的原图，所以用客户区原始坐标
+            // （GaussianBeam 实测 1440x829）。
+            "roi": [0, 0, 0, 0],
+
+            // 数值解析正则，默认抓第一个数字（含小数、正负号）
+            "pattern": "[-+]?\\d+(?:\\.\\d+)?",
+            "ocr_node": "LaserSweepOcrValueB",
+            // 要找「离某词最近的数值」就必须做检测+识别，不能只识别
+            "only_rec": false
+        },
+        "action": "DoNothing",
+        "timeout": 10000,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepRecord"],
+        "on_error": ["LaserSweepRecordFailed"]
+    },
+
+    // OCR 子节点：不参与主流程，只被 laser_read_value_b 通过 run_recognition 调用
+    "LaserSweepOcrValueB": {
+        "recognition": "OCR",
+        "roi": [0, 0, 0, 0],
+        // only_rec = 只识别不检测（整块 ROI 当成一段文字），框准了才用；
+        // 要找「离某词最近的数值」必须设为 false，让它逐块检测
+        "only_rec": false,
+        "action": "DoNothing"
+    },
+
+    // ---------- ⑩ 把结果追加进 CSV ----------
+    "LaserSweepRecord": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_record",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepWaitProcessDone"]
+    },
+    "LaserSweepRecordFailed": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_record_failed",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepWaitProcessDone"]
+    },
+
+    // ---------- ⑪ 等待本次测量操作执行完毕 ----------
+    "LaserSweepWaitProcessDone": {
+        "recognition": "DirectHit",
+        "action": "DoNothing",
+        // post_wait_freezes：画面连续 3 秒没有较大变化才认为操作结束
+        "post_wait_freezes": 3000,
+        // 再补 1 秒余量；如果 B 软件有明确的「完成」提示，
+        // 更推荐改成识别那个提示（OCR / TemplateMatch）后再往下走
+        "post_delay": 1000,
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "next": ["LaserSweepAdvance"]
+    },
+
+    // ---------- ⑫ 换下一个参数；跑完 11 组就收尾 ----------
+    "LaserSweepAdvance": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_advance",
+        "custom_action_param": {
+            "done_node": "LaserSweepDone"
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        // 默认回到流程头部继续下一组；参数用尽时由 laser_sweep_advance
+        // 通过 context.override_next 改写成 LaserSweepDone
+        "next": ["LaserSweepApplyParam"]
+    },
+
+    // ---------- ⑬ 收尾 ----------
+    "LaserSweepDone": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_finish",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0
+    },
+
+    // ---------- 出错时中止：打印原因 + 已有的 CSV 路径 ----------
+    "LaserSweepAbort": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_abort",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0
+    },
+
+    // ==========================================================================
+    //  以下为 MaaFramework 模板自带的示例节点，与激光扫描无关，可整段删除
+    //  （删除时记得同步删掉 assets/interface.json 里对应的 task 条目）
+    // ==========================================================================
     "MyTask1": {},
     "MyTask2": {},
     "MyTask3": {},

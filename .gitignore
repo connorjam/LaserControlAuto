@@ -452,3 +452,8 @@ tools/ImageCropper/**/*.png
 
 config
 debug
+# 扫描结果输出目录（见 assets/interface.json 的「输出文件夹」）
+output
+# 打包相关产物：MFAAvalonia 下载目录、最终压缩包
+MFA
+dist

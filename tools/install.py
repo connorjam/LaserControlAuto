@@ -1,16 +1,64 @@
 from pathlib import Path
 
+import json
+import re
 import shutil
 import sys
 
+
+# interface.json 是 JSONC（带注释）。优先用 json-with-comments，
+# 没装就退回内置的最小实现 —— 免得为了打包还得先装个包。
 try:
     import jsonc
-except ModuleNotFoundError as e:
-    raise ImportError(
-        "Missing dependency 'json-with-comments' (imported as 'jsonc').\n"
-        f"Install it with:\n  {sys.executable} -m pip install json-with-comments\n"
-        "Or add it to your project's requirements."
-    ) from e
+except ModuleNotFoundError:
+    class _Jsonc:
+        """够用就行的 JSONC 读写：去掉 // 和 /* */ 注释。"""
+
+        @staticmethod
+        def _strip(text: str) -> str:
+            out, i, state = [], 0, 0
+            while i < len(text):
+                c = text[i]
+                if state == 0:
+                    if c == '"':
+                        out.append(c)
+                        state = 1
+                        i += 1
+                    elif text[i : i + 2] == "//":
+                        while i < len(text) and text[i] != "\n":
+                            i += 1
+                    elif text[i : i + 2] == "/*":
+                        i += 2
+                        while i + 1 < len(text) and text[i : i + 2] != "*/":
+                            i += 1
+                        i += 2
+                    else:
+                        out.append(c)
+                        i += 1
+                elif state == 1:
+                    out.append(c)
+                    if c == "\\":
+                        state = 2
+                    elif c == '"':
+                        state = 0
+                    i += 1
+                else:
+                    out.append(c)
+                    state = 1
+                    i += 1
+            return "".join(out)
+
+        @staticmethod
+        def load(fp):
+            return json.loads(_Jsonc._strip(fp.read()))
+
+        @staticmethod
+        def dump(obj, fp, **kwargs):
+            kwargs.pop("ensure_ascii", None)
+            fp.write(json.dumps(obj, ensure_ascii=False, **kwargs))
+
+    jsonc = _Jsonc()
+    print("[install] 没装 json-with-comments，使用内置的 JSONC 读写")
 
 from configure import configure_ocr_model
 
@@ -99,6 +147,59 @@ def install_deps():
 
 
 
+def rewrite_agent_paths(interface: dict) -> None:
+    """把 interface.json 里 agent 的路径从「开发布局」改写成「打包布局」。
+
+    子进程的 CWD 是 interface.json 所在目录，两个布局下 agent 的位置不一样：
+
+        开发时：  assets/interface.json        -> 仓库根/agent      要写 ../agent/main.py
+        打包后：  install/interface.json       -> install/agent     要写 ./agent/main.py
+
+    所以开发用的 assets/interface.json 里填的是 ../agent/main.py，
+    打包时必须在这里改回来，否则最终用户那边会找不到 agent/main.py。
+
+    顺带把 child_exec 也换掉：如果 deps/python 存在（跑过
+    tools/prepare_embedded_python.py），就改成随包附带的便携版解释器，
+    这样用户电脑上没装 Python 也能跑。
+    """
+    agent = interface.get("agent")
+    if not agent:
+        return
+
+    fixed = []
+    for arg in agent.get("child_args", []):
+        normalized = str(arg).replace("\\", "/")
+        if normalized.endswith("agent/main.py"):
+            fixed.append("./agent/main.py")
+        else:
+            fixed.append(arg)
+    agent["child_args"] = fixed
+
+    bundled = install_path / "python" / "python.exe"
+    if bundled.exists():
+        agent["child_exec"] = "./python/python.exe"
+        print("[install] agent 将使用随包附带的便携版 Python: ./python/python.exe")
+    else:
+        print(
+            "[install] 没找到 deps/python，agent 仍使用系统 PATH 里的 python。\n"
+            "          想让用户免装 Python，请先跑：\n"
+            "            python tools/prepare_embedded_python.py"
+        )
+
+
+def install_embedded_python():
+    """把 deps/python（便携版解释器 + 依赖）复制进 install/python。"""
+    src = working_dir / "deps" / "python"
+    if not (src / "python.exe").exists():
+        print("[install] 跳过便携版 Python（deps/python/python.exe 不存在）")
+        return
+
+    dst = install_path / "python"
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    size = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
+    print(f"[install] 已打入便携版 Python：{dst}  ({size // 1024 // 1024} MB)")
+
+
 def install_resource():
 
     configure_ocr_model()
@@ -117,6 +218,7 @@ def install_resource():
         interface = jsonc.load(f)
 
     interface["version"] = version
+    rewrite_agent_paths(interface)
 
     with open(install_path / "interface.json", "w", encoding="utf-8") as f:
         jsonc.dump(interface, f, ensure_ascii=False, indent=4)
@@ -143,6 +245,9 @@ def install_agent():
 
 if __name__ == "__main__":
     install_deps()
+    # 便携版 Python 要在 install_resource() 之前拷好：
+    # rewrite_agent_paths() 靠它是否存在来决定 child_exec 写什么
+    install_embedded_python()
     install_resource()
     install_chores()
     install_agent()

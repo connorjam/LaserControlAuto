@@ -1,109 +1,174 @@
 {
-    // 本文件主要定义了通用 UI 的行为和显示内容
-    // 可参考文档和示例添加更多您需要的功能
+    // 本文件定义了通用 UI（MFAAvalonia / MXU 等）的行为和显示内容
     // 文档：https://maafw.xyz/docs/3.3-ProjectInterfaceV2
-    // 示例：https://github.com/MaaXYZ/MaaFramework/blob/main/sample/interface.json
     "interface_version": 2,
-    "name": "MaaXXX",
-    "description": "这是一个使用 MaaFramework 创建的新项目。",
-    "contact": "QQ群: 123456789",
+    "name": "LaserControlAuto",
+    "label": "激光控制自动化",
+    "description": "在低噪声驱动调试软件里自动设置参数，等待稳定后到测量软件读取数值，逐点记录到 CSV。",
     "license": "MIT",
-    "welcome": "首次使用！欢迎使用 MAA!",
-    // 填写项目地址和版本号可实现自动更新功能
-    "github": "https://github.com/MaaXYZ/MaaPracticeBoilerplate",
+    "welcome": [
+        "## 使用前请先确认\n\n1. **A 软件**（要设置参数的那个）已经打开，并且停在含目标参数的那一页。\n2. **B 软件**（要读数值的那个）也已经打开。\n3. 在下面的「扫描设置」里填好**起始值 / 结束值 / 步长**和**输出文件夹**。\n\n点「开始任务」后程序会自动完成整个扫描，期间请不要用手去动鼠标键盘。\n\n结果会保存成 CSV 文件，路径在运行日志里会打印出来。"
+    ],
     "version": "1.0.0",
-    // Mirror酱为第三方分发服务，新项目默认关闭
-    // 若有需要请联系 Mirror酱 开通，直接自行开启是无法使用的
-    // "mirrorchyan_rid": "MaaXXX",
-    // "mirrorchyan_multiplatform": true,
+    "contact": "https://github.com/connorjam/LaserControlAuto",
+    "github": "https://github.com/connorjam/LaserControlAuto",
+
+    // ======================================================================
+    //  控制器
+    //  ⚠️ Win32 控制器一次只能绑定一个窗口，截图和点击都只作用于它。
+    //     这里绑定的是「A 软件」；B 软件由 agent 自己另外截图（见 agent/laser_sweep.py）。
+    // ======================================================================
     "controller": [
-        {
-            "name": "安卓端",
-            "type": "Adb",
-            "display_short_side": 720 // 默认缩放分辨率的短边长度
-        },
         {
             "name": "桌面端",
             "type": "Win32",
             "win32": {
                 "class_regex": ".*",
-                "window_regex": "Visual Studio",
-                // 截图及控制方式，请根据项目实际情况修改
-                // 文档: https://maafw.xyz/docs/2.4-ControlMethods
-                "screencap": "PrintWindow", // 截图方式
+                // A 软件（Low_Noise_Drive_Debugger_V2.13.exe）的窗口标题，实测为：
+                //     Low Noise Driver Debugger V2.13        （class = Qt5QWindowIcon）
+                // 用 \s+ 匹配空格，标题里的版本号变了也不影响。
+                "window_regex": "Low\\s+Noise\\s+Driver\\s+Debugger",
+                // 截图方式。文档: https://maafw.xyz/docs/2.4-ControlMethods
+                //
+                // ⚠️ 用 FramePool，不要用 PrintWindow / Background：
+                //    PrintWindow 遇到「DPI 不感知」的程序（窗口 DPI=96）时，
+                //    只会渲染出左上角 1/4 的画面，内容占比 50%，OCR 直接废掉。
+                //    Background(=FramePool|PrintWindow) 也不行——框架是「挑最快的」，
+                //    实测它会选中 PrintWindow(32ms)，照样坏。
+                //
+                //    实测（本机 A 软件 + GaussianBeam 两扇窗口）：
+                //      方式                  DPI不感知窗口   DPI感知窗口
+                //      GDI                      50% ❌        100% ✅
+                //      FramePool               100% ✅        100% ✅   ← 用这个
+                //      DXGI_DesktopDup         100% ✅        100% ✅   （但尺寸会变，慎用）
+                //      DXGI_DesktopDup_Window  100% ✅        100% ✅
+                //      PrintWindow              50% ❌        100% ✅
+                //      ScreenDC                100% ✅        100% ✅
+                //      Background(18)           50% ❌        100% ✅
+                //
+                //    已验证：换 FramePool 后截图尺寸仍是 1331x720，
+                //    Temperature / Setting 的坐标和 PrintWindow 完全一致。
+                //    万一新软件用 FramePool 截不到，依次试 ScreenDC、DXGI_DesktopDup_Window。
+                "screencap": "FramePool",
                 "mouse": "PostMessageWithCursorPos", // 鼠标控制方式
                 "keyboard": "PostMessageWithCursorPos" // 键盘控制方式
             }
         }
     ],
+
     "resource": [
         {
-            "name": "官服",
+            "name": "默认",
             "path": [
                 "./resource"
-            ]
-        },
-        {
-            "name": "B 服",
-            "path": [
-                "./resource"
-                // "./resource_bilibili"
             ]
         }
     ],
-    // 可选的 agent 示例
-    // "agent": {
-    //     "child_exec": "python",
-    //     "child_args": [
-    //         "./agent/main.py"
-    //     ]
-    // },
+
+    // ======================================================================
+    //  AgentServer：自定义识别 / 自定义动作跑在这个 Python 子进程里
+    //  对应仓库根目录的 agent/main.py，实现在 agent/laser_sweep.py
+    //
+    //  ⚠️ 路径写成 ../agent/main.py 是必须的，不是笔误：
+    //     子进程的 CWD 是「interface.json 所在目录」，也就是 assets/，
+    //     而 agent/ 在仓库根目录，所以要从 assets/ 往上走一级。
+    //     （模板自带的示例写 ./agent/main.py，那只适用于打包后的 install/ 布局）
+    //
+    //  打包时 tools/install.py 会自动改写这两处：
+    //     child_args → ./agent/main.py
+    //     child_exec → ./python/python.exe （随包附带的便携版 Python）
+    // ======================================================================
+    "agent": {
+        "child_exec": "python",
+        "child_args": [
+            "../agent/main.py"
+        ]
+    },
+
+    // ======================================================================
+    //  任务
+    // ======================================================================
     "task": [
         {
-            "name": "普通任务",
-            "entry": "MyTask1"
-        },
-        {
-            "name": "选项任务",
-            "entry": "MyTask2",
+            "name": "激光参数扫描",
+            "entry": "LaserSweepStart",
             "option": [
-                "任务选项1"
+                "扫描设置"
             ]
-        },
-        {
-            "name": "参数任务",
-            "entry": "MyTask3",
-            "option": [
-                "任务选项1"
-            ],
-            "pipeline_override": {}
-        },
-        {
-            "name": "自定义识别与动作示例",
-            "entry": "FindSmallestNumber"
         }
     ],
+
+    // ======================================================================
+    //  可配置项（会显示在 UI 上让用户填写）
+    // ======================================================================
     "option": {
-        "任务选项1": {
-            "type": "select",
-            "cases": [
+        "扫描设置": {
+            "type": "input",
+            "label": "扫描设置",
+            "description": "设置参数扫描的范围、等待时间和结果保存位置。改完直接点开始任务即可生效。",
+            "inputs": [
                 {
-                    "name": "文本1",
-                    "pipeline_override": {
-                        "OcrTask": {
-                            "text": "文本1"
-                        }
-                    }
+                    "name": "起始值",
+                    "label": "起始值",
+                    "description": "从哪个数值开始扫描",
+                    "default": "20",
+                    // 允许整数和小数（含负号）
+                    "verify": "^-?\\d+(?:\\.\\d+)?$",
+                    "pattern_msg": "请填数字，例如 20 或 20.5"
                 },
                 {
-                    "name": "文本2",
-                    "pipeline_override": {
-                        "OcrTask": {
-                            "text": "文本2"
-                        }
+                    "name": "结束值",
+                    "label": "结束值",
+                    "description": "扫描到哪个数值为止（含这个值）",
+                    "default": "30",
+                    "verify": "^-?\\d+(?:\\.\\d+)?$",
+                    "pattern_msg": "请填数字，例如 30"
+                },
+                {
+                    "name": "步长",
+                    "label": "步长",
+                    "description": "每一步增加多少。填 1 就是 20,21,22…；填 0.5 也行",
+                    "default": "1",
+                    "verify": "^\\d+(?:\\.\\d+)?$",
+                    "pattern_msg": "请填正数，例如 1 或 0.5"
+                },
+                {
+                    "name": "等待秒数",
+                    "label": "每轮等待秒数",
+                    "description": "在 A 软件里设好参数后，等多久再去 B 软件读数",
+                    "default": "10",
+                    "verify": "^\\d+$",
+                    "pattern_msg": "请填非负整数，例如 10"
+                },
+                {
+                    "name": "输出文件夹",
+                    "label": "输出文件夹",
+                    "description": "结果 CSV 保存到哪个文件夹。可以填相对路径（如 output）或绝对路径（如 D:\\数据）。留空则用 output",
+                    "default": "output"
+                }
+            ],
+            // 用户填的值会通过 {名称} 占位符替换到这里
+            //
+            // ⚠️ 这里把 custom_action_param 的**全部字段**都写全了：
+            //    pipeline_override 对对象是「整体替换」而不是逐字段合并，
+            //    少写一个字段就会把它从原 pipeline 里抹掉。
+            "pipeline_override": {
+                "LaserSweepStart": {
+                    "custom_action_param": {
+                        "start": "{起始值}",
+                        "end": "{结束值}",
+                        "step": "{步长}",
+                        "wait_sec": "{等待秒数}",
+                        "csv_dir": "{输出文件夹}",
+                        "csv_header": [
+                            "序号",
+                            "设定参数",
+                            "B软件测量值",
+                            "时间"
+                        ]
                     }
                 }
-            ]
+            }
         }
     }
 }
