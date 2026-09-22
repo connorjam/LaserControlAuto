@@ -183,6 +183,181 @@ def _distance_sq(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> 
     return (ax - bx) ** 2 + (ay - by) ** 2
 
 
+def _rect_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[float, float]:
+    """两个矩形的水平 / 垂直重叠长度（没有重叠就是 0）。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    overlap_x = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    overlap_y = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    return overlap_x, overlap_y
+
+
+def _overlap_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """交集面积 ÷ 较小那个框的面积，用来判断「这俩是不是同一处文字」。"""
+    overlap_x, overlap_y = _rect_overlap(a, b)
+    smaller = min(a[2] * a[3], b[2] * b[3])
+    return (overlap_x * overlap_y) / smaller if smaller > 0 else 0.0
+
+
+def _edge_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """两个框「边缘到边缘」的最短距离（贴在一起就是 0）。
+
+    有了它，「右边的数值」和「下面的数值」才能放在同一把尺子上比远近 ——
+    水平间距和垂直间距本来没法直接比大小。
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    dx = max(0.0, max(ax - (bx + bw), bx - (ax + aw)))
+    dy = max(0.0, max(ay - (by + bh), by - (ay + ah)))
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _pick_right_side(
+    anchor_box: tuple[int, int, int, int],
+    candidates: list[tuple[tuple[int, int, int, int], str, float]],
+    gap_tolerance: float = 6.0,
+    overlap_ratio: float = 0.5,
+) -> list[tuple[float, tuple[int, int, int, int], str, float]]:
+    """挑「锚点右边、同一行」的候选，按水平距离从近到远排好。
+
+    这一条是 2026-09-22 换电脑后踩出来的坑：B 软件的标签本身含数字
+    （"功率CH1"），宽松正则会在**标签自己**身上匹配出 "1"，
+    中心距离 = 0，于是永远选中标签自己，测量值恒定 = 1。
+    所以在这里立三条硬规矩：
+
+        ① 不许和锚点重叠 —— 直接掐掉自匹配；
+        ② 中心必须在锚点中心右侧；
+        ③ 必须和锚点在同一水平带（垂直方向重叠够多）。
+
+    真正的目标 "-79.720dBm" 正好满足全部三条：
+        锚点 (748,83,89,25) → 右边界 837；候选 (850,84,132,24) → 起点 850，y 几乎完全重合。
+    """
+    ax, ay, aw, ah = anchor_box
+    anchor_cx = ax + aw / 2.0
+    anchor_right = ax + aw
+
+    picked: list[tuple[float, tuple[int, int, int, int], str, float]] = []
+    for box, text, value in candidates:
+        bx, by, bw, bh = box
+        if _overlap_ratio(anchor_box, box) > 0.3:
+            continue  # ① 自匹配 / 压在锚点上的文字
+        if bx + bw / 2.0 <= anchor_cx:
+            continue  # ② 在左边
+        if bx < anchor_right - gap_tolerance:
+            continue  # ② 起点跑到锚点里去了
+        _, overlap_y = _rect_overlap(anchor_box, box)
+        if overlap_y < min(ah, bh) * overlap_ratio:
+            continue  # ③ 不在同一行
+        picked.append((bx - anchor_right, box, text, value))
+
+    picked.sort(key=lambda item: item[0])
+    return picked
+
+
+def _pick_below(
+    anchor_box: tuple[int, int, int, int],
+    candidates: list[tuple[tuple[int, int, int, int], str, float]],
+    gap_tolerance: float = 6.0,
+    overlap_ratio: float = 0.5,
+) -> list[tuple[float, tuple[int, int, int, int], str, float]]:
+    """挑「锚点正下方」的候选，按垂直距离从近到远排好。
+
+    旧 B 软件（GaussianBeam）是「标签在上、数值在下」的布局
+    （"Wavelength" 下面一行就是 "1061 nm"），所以右侧那套规则对它不适用，
+    这里补一套上下布局的规则，两边都能用。
+    """
+    ax, ay, aw, ah = anchor_box
+    anchor_cy = ay + ah / 2.0
+    anchor_bottom = ay + ah
+
+    picked: list[tuple[float, tuple[int, int, int, int], str, float]] = []
+    for box, text, value in candidates:
+        bx, by, bw, bh = box
+        if _overlap_ratio(anchor_box, box) > 0.3:
+            continue
+        if by + bh / 2.0 <= anchor_cy:
+            continue  # 在上方
+        if by < anchor_bottom - gap_tolerance:
+            continue
+        overlap_x, _ = _rect_overlap(anchor_box, box)
+        if overlap_x < min(aw, bw) * overlap_ratio:
+            continue  # 不在同一列
+        picked.append((by - anchor_bottom, box, text, value))
+
+    picked.sort(key=lambda item: item[0])
+    return picked
+
+
+def _input_box_between(
+    anchor_box: tuple[int, int, int, int],
+    button_box: tuple[int, int, int, int],
+    hits: list[tuple[tuple[int, int, int, int], str]],
+) -> tuple[int, int, int, int]:
+    """用同一屏 OCR 到的真实框，夹出「标签」与「按钮」之间那个输入框的位置。
+
+    A 软件每一行都是 [标签] [输入框] [Setting 按钮] 的排法。
+    以前输入框位置是「标签中心 + 图像宽度 × 固定比例」算出来的，
+    换台电脑窗口尺寸一变就偏了（2026-09-22 换机后点不到输入框）。
+    现在改成实测算：
+
+        ① 标签右边界 ~ 按钮左边界之间如果有文字（通常就是输入框里的当前值），
+           直接拿那块文字的框 —— 它就是输入框内容，点在它身上必然准；
+        ② 中间什么都没有（输入框是空的）就取两者中点，高度取标签高度。
+
+    全程只用这一屏 OCR 出来的框，不依赖任何写死的像素或比例，
+    窗口怎么缩放、DPI 怎么变都跟得上。
+    """
+    ax, ay, aw, ah = anchor_box
+    bx, by, bw, bh = button_box
+
+    left = ax + aw  # 标签右边界
+    right = bx  # 按钮左边界
+    band_top = min(ay, by) - 6
+    band_bottom = max(ay + ah, by + bh) + 6
+
+    if right <= left:
+        # 说明这一屏的「标签 / 按钮」不是左右排布（比如按钮跑到标签上面去了），
+        # 夹逼法失效，退回按钮左侧一小块，至少还在同一行
+        fallback = (int(bx - max(48, bw)), int(by), int(max(48, bw)), max(1, int(bh)))
+        print(f"[laser_sweep]   标签/按钮不是左右排布，退回按钮左侧 {fallback}")
+        return fallback
+
+    # ① 中间夹着的文字 = 输入框里的当前值
+    inner: list[tuple[int, tuple[int, int, int, int], str]] = []
+    for box, text in hits:
+        cx, cy, cw, ch = box
+        if cx < left - 4 or cx + cw > right + 4:
+            continue  # 不在标签与按钮之间
+        if not (band_top <= cy + ch / 2.0 <= band_bottom):
+            continue  # 不在同一行
+        if not re.search(r"\d", text):
+            continue  # 输入框里应该是数字，纯文字多半是别的标签
+        inner.append((cw, box, text))
+
+    if inner:
+        inner.sort(key=lambda item: -item[0])  # 最宽的那个最像输入框内容
+        _, box, text = inner[0]
+        print(f"[laser_sweep]   标签与按钮之间命中 {text!r} @ {box}，按它定位输入框")
+        return box
+
+    # ② 输入框是空的，取中点
+    mid_x = left + (right - left) / 2.0
+    center_y = (ay + ah / 2.0 + by + bh / 2.0) / 2.0
+    width = max(1, int(right - left))
+    height = max(1, int(max(ah, bh)))
+    box = (
+        int(round(mid_x - width / 2.0)),
+        int(round(center_y - height / 2.0)),
+        width,
+        height,
+    )
+    print(
+        f"[laser_sweep]   标签右边界 {int(left)} ~ 按钮左边界 {int(right)}"
+        f" 之间没有文字，取中点作为输入框 {box}"
+    )
+    return box
+
+
 def _collect_hits(results: Any) -> list[tuple[tuple[int, int, int, int], str]]:
     """把 OCR 结果列表转成 [(box, text), ...]，忽略没有位置的项。"""
     hits: list[tuple[tuple[int, int, int, int], str]] = []
@@ -233,6 +408,21 @@ def _match_text(
         return hits
     needles = [w.lower() for w in wanted]
     return [(box, text) for box, text in hits if any(n in text.lower() for n in needles)]
+
+
+def _anchor_texts(param: dict[str, Any], key: str = "anchor_text") -> list[str]:
+    """把锚点词读成列表：既支持 "Temperature" 也支持 ["功率CH1", "Wavelength"]。
+
+    写成数组的好处是**一台配置能同时伺候两套软件**：换电脑/换 B 软件之后
+    标签词不一样，把新词加进数组即可，不用删掉旧的再改回来。
+    """
+    raw = param.get(key)
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    return [text] if text else []
 
 
 def _append_row(measured: Optional[float]) -> bool:
@@ -692,14 +882,17 @@ def _resolve_image_size(context: Context) -> Optional[tuple[int, int]]:
 
 @AgentServer.custom_action("laser_click_right_of")
 class LaserClickRightOf(CustomAction):
-    """点「锚点框中心 + 图像宽度 × dx_ratio」这个位置。
+    """点「识别出来的那个框」——默认为框中心，也可按比例/像素再偏一点。
 
-    原来用的是 Click + target_offset: [98, 0, 0, 0]，
-    那个 98 是照着 1331x720 那张截图量出来的**绝对像素**，窗口尺寸一变就废。
-    改成按图像宽度的比例之后，只要界面布局的相对位置不变，
-    分辨率怎么变都能自动跟上（换了软件才需要重新量比例）。
+    v1.0.1 之前写的是「标签中心 + 图像宽度 × dx_ratio」，那个比例是照着
+    1331x720 那台电脑量出来的。2026-09-22 换到另一台电脑（窗口更小）就点不到
+    输入框了 —— 因为界面控件的间距并不会跟着窗口等比缩放，比例法必然失准。
 
-    锚点框通过节点的 target 字段传进来，会落在 argv.box。
+    现在输入框位置由 laser_find_nearest_setting 的 return_box="input" 在
+    **每一屏实时 OCR** 里夹出来，这里默认直接点框中心即可；
+    dx_ratio / dy_ratio / dx_px / dy_px 仍保留，需要额外微调时再用。
+
+    框通过节点的 target 字段传进来，会落在 argv.box。
     """
 
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
@@ -709,22 +902,26 @@ class LaserClickRightOf(CustomAction):
             print(f"[laser_sweep] 拿不到锚点框（argv.box={argv.box}），检查一下节点的 target 字段")
             return False
 
-        size = _state.get("image_size") or _resolve_image_size(context)
-        if size:
-            img_w, img_h = size
-            dx_px = float(param.get("dx_ratio", 0.0736)) * img_w
-            dy_px = float(param.get("dy_ratio", 0.0)) * img_h
-            print(f"[laser_sweep]   截图尺寸 {img_w}x{img_h}，按比例算偏移")
-        else:
-            # 拿不到尺寸就退回绝对像素，至少还能跑
-            dx_px = float(param.get("dx_px", 0.0))
-            dy_px = float(param.get("dy_px", 0.0))
-            print("[laser_sweep]   拿不到截图尺寸，改用绝对偏移 dx_px/dy_px")
+        dx_px = float(param.get("dx_px", 0.0) or 0.0)
+        dy_px = float(param.get("dy_px", 0.0) or 0.0)
+        dx_ratio = float(param.get("dx_ratio", 0.0) or 0.0)
+        dy_ratio = float(param.get("dy_ratio", 0.0) or 0.0)
+
+        if dx_ratio or dy_ratio:
+            # 兼容老写法：再按截图宽高的比例补一点偏移
+            size = _state.get("image_size") or _resolve_image_size(context)
+            if size:
+                img_w, img_h = size
+                dx_px += dx_ratio * img_w
+                dy_px += dy_ratio * img_h
+                print(f"[laser_sweep]   截图尺寸 {img_w}x{img_h}，按比例补偏移")
+            else:
+                print("[laser_sweep]   拿不到截图尺寸，只按绝对偏移算")
 
         cx, cy = _center(box)
         x, y = int(round(cx + dx_px)), int(round(cy + dy_px))
         print(
-            f"[laser_sweep]   锚点 {box} 中心 ({cx:.0f}, {cy:.0f})"
+            f"[laser_sweep]   目标框 {box} 中心 ({cx:.0f}, {cy:.0f})"
             f" + ({dx_px:.0f}, {dy_px:.0f}) → 点击 ({x}, {y})"
         )
 
@@ -749,14 +946,14 @@ class LaserFindNearestSetting(CustomRecognition):
         param = _param(argv.custom_recognition_param)
         ocr_node = str(param.get("ocr_node") or "LaserSweepOcrSetting")
         roi = param.get("roi") or [0, 0, 0, 0]
-        anchor_text = str(param.get("anchor_text") or "Temperature")
+        anchor_texts = _anchor_texts(param) or ["Temperature"]
         target_text = str(param.get("target_text") or "Setting")
-        # "target"（默认）返回离锚点最近的按钮；"anchor" 返回那个锚点本身。
-        # 界面上常有多个同名标签时，用同一套「配对」逻辑先锁定正确的那一行，
-        # 再拿它的锚点框去算「往右多少是输入框」。
+        # "target"（默认）返回离锚点最近的按钮；"anchor" 返回那个锚点本身；
+        # "input" 返回「标签与按钮之间」那个输入框的位置（每次执行都重新 OCR 定位，
+        # 不依赖任何写死的比例，换电脑/换分辨率都能自己跟上）。
         return_box = str(param.get("return_box") or "target").lower()
 
-        # 记下当前截图的尺寸，后面按比例算偏移要用（比写死像素抗缩放）
+        # 记下当前截图的尺寸，仅作日志/兜底用；定位本身已经不依赖它了
         _remember_image_size(argv.image)
 
         # 这两个词都要做「检测 + 识别」，所以 only_rec 必须是 False
@@ -767,12 +964,12 @@ class LaserFindNearestSetting(CustomRecognition):
                 detail={"error": "这一屏没有 OCR 到任何文字"},
             )
 
-        anchors = _match_text(raw, [anchor_text])
+        anchors = _match_text(raw, anchor_texts)
         if not anchors:
             return CustomRecognition.AnalyzeResult(
                 box=None,
                 detail={
-                    "error": f"没找到 {anchor_text!r}",
+                    "error": f"没找到 {anchor_texts!r}",
                     "ocr_texts": [t for _, t in raw],
                 },
             )
@@ -782,7 +979,7 @@ class LaserFindNearestSetting(CustomRecognition):
             return CustomRecognition.AnalyzeResult(
                 box=None,
                 detail={
-                    "error": f"找到了 {anchor_text!r} 但没找到 {target_text!r}",
+                    "error": f"找到了 {anchor_texts!r} 但没找到 {target_text!r}",
                     "ocr_texts": [t for _, t in raw],
                 },
             )
@@ -807,9 +1004,18 @@ class LaserFindNearestSetting(CustomRecognition):
         dist, anchor_box, anchor_text_used, best_box, best_text = best
         print(f"[laser_sweep]   选中：锚点 {anchor_text_used!r} @ {anchor_box} → 按钮 {best_text!r} @ {best_box}")
 
-        chosen_box = anchor_box if return_box == "anchor" else best_box
-        if return_box == "anchor":
+        if return_box == "input":
+            # ★ 在这里现场折算输入框位置：用的是**这一屏**刚 OCR 出来的标签框与按钮框，
+            #   所以窗口尺寸/DPI 怎么变都不用改配置。
+            chosen_box = _input_box_between(anchor_box, best_box, raw)
+            returned = "input"
+        elif return_box == "anchor":
+            chosen_box = anchor_box
+            returned = "anchor"
             print(f"[laser_sweep]   按 return_box=anchor 返回锚点框 {chosen_box}")
+        else:
+            chosen_box = best_box
+            returned = "target"
 
         return CustomRecognition.AnalyzeResult(
             box=chosen_box,
@@ -818,7 +1024,8 @@ class LaserFindNearestSetting(CustomRecognition):
                 "anchor_box": list(anchor_box),
                 "chosen": best_text,
                 "chosen_box": list(best_box),
-                "returned": "anchor" if return_box == "anchor" else "target",
+                "returned": returned,
+                "input_box": list(chosen_box) if returned == "input" else None,
                 "distance_sq": round(dist, 1),
                 "anchor_count": len(anchors),
                 "candidate_boxes": [list(b) for b, _ in candidates],
@@ -879,13 +1086,13 @@ class LaserReadValueB(CustomRecognition):
     ) -> CustomRecognition.AnalyzeResult:
         ocr_node = str(param.get("ocr_node") or "LaserSweepOcrValueB")
         roi = param.get("roi")
-        anchor_text = str(param.get("anchor_text") or "").strip()
+        anchor_texts = _anchor_texts(param)
 
         # 要找「离某个词最近的数值」就必须做全屏检测+识别，
         # 只识别（only_rec）会把整块 ROI 当成一段文字，是找不到单个数值的。
         only_rec_param = param.get("only_rec")
-        only_rec = (not anchor_text) if only_rec_param is None else bool(only_rec_param)
-        if anchor_text and only_rec:
+        only_rec = (not anchor_texts) if only_rec_param is None else bool(only_rec_param)
+        if anchor_texts and only_rec:
             print("[laser_sweep]   提示：配了 anchor_text 又开 only_rec，建议把 only_rec 设为 false")
 
         hits = _ocr_hits(context, image, ocr_node, [], roi, only_rec=only_rec)
@@ -910,7 +1117,7 @@ class LaserReadValueB(CustomRecognition):
                 detail={"error": f"识别到的内容里没有数字: {[t for _, t in hits]}"},
             )
 
-        if not anchor_text:
+        if not anchor_texts:
             box, text, value = candidates[0]
             _state["measured"] = value
             print(f"[laser_sweep]   B 软件 OCR 文本 {text!r} → 测量值 = {_fmt(value)}")
@@ -919,31 +1126,86 @@ class LaserReadValueB(CustomRecognition):
                 detail={"mode": "ocr", "text": text, "measured": value},
             )
 
-        # ---- 找离 anchor_text 最近的那个数值 ----
-        anchors = _match_text(hits, [anchor_text])
+        # ---- 找 anchor_text 旁边的那个数值 ----
+        anchors = _match_text(hits, anchor_texts)
         if not anchors:
             return CustomRecognition.AnalyzeResult(
                 box=None,
                 detail={
-                    "error": f"没找到 {anchor_text!r}",
+                    "error": f"没找到 {anchor_texts!r}",
                     "ocr_texts": [t for _, t in hits],
                 },
             )
 
-        # 同样用「全局最小配对」：万一界面上有多处同名标签，取整体距离最小的那一对
-        best: Optional[tuple[float, tuple, str, tuple, str, float]] = None
+        # 位置感知的挑选：先「锚点右侧同一行」，再「锚点正下方同一列」，
+        # 两条都不成立才退回「中心距离最近」。
+        #
+        # 为什么不能只用中心距离：锚点文字自己可能含数字。B 软件的标签是
+        # "功率CH1"，宽松正则在**标签本身**上就能匹配出 "1"，中心距离 = 0，
+        # 于是每轮都选中标签自己，测量值恒定 = 1（2026-09-22 换电脑后实测踩到）。
+        prefer = str(param.get("prefer") or "auto").lower()
+        layouts: list[str] = []
+        if prefer in ("auto", "right"):
+            layouts.append("right")
+        if prefer in ("auto", "below"):
+            layouts.append("below")
+
+        # 两种布局的候选放一起、用「边缘最短距离」统一比远近。
+        # 不能「右侧整层优先」：旧 B 软件（GaussianBeam）数值在正下方，
+        # 但它右边同一行也可能有别的小数字，整层优先就会挑错。
+        scored: list[tuple[float, tuple, str, tuple, str, float, str]] = []
+        for layout in layouts:
+            for a_box, a_label in anchors:
+                picked = (
+                    _pick_right_side(a_box, candidates)
+                    if layout == "right"
+                    else _pick_below(a_box, candidates)
+                )
+                for _, box, text, value in picked:
+                    gap = _edge_gap(a_box, box)
+                    scored.append((gap, a_box, a_label, box, text, value, layout))
+                    print(
+                        f"[laser_sweep]   {layout} 布局候选：{a_label!r} @ {a_box}"
+                        f" → {text!r} @ {box}（边缘间距 {gap:.0f}px）"
+                    )
+
+        best = min(scored, key=lambda item: item[0]) if scored else None
+
+        if best is not None:
+            gap, anchor_box, label, box, text, value, layout = best
+            _state["measured"] = value
+            side = "右侧" if layout == "right" else "下方"
+            print(
+                f"[laser_sweep]   B 软件：{label!r} {side}的数值 {text!r}"
+                f" → 测量值 = {_fmt(value)}（相邻 {gap:.0f}px）"
+            )
+            return CustomRecognition.AnalyzeResult(
+                box=box,
+                detail={
+                    "mode": "ocr",
+                    "anchor": label,
+                    "anchor_box": list(anchor_box),
+                    "layout": layout,
+                    "text": text,
+                    "measured": value,
+                    "gap": round(gap, 1),
+                },
+            )
+
+        # ---- 兜底：位置规则全落空时才退回老写法，并明确告警 ----
+        print(
+            "[laser_sweep]   ⚠️ 没找到「在锚点旁边」的数值，退回按中心距离挑最近的一个，"
+            "结果不一定准；建议检查 anchor_text 是否写对"
+        )
+        fallback: Optional[tuple[float, tuple, str, tuple, str, float]] = None
         for a_box, a_label in anchors:
             for box, text, value in candidates:
                 dist = _distance_sq(a_box, box)
-                print(
-                    f"[laser_sweep]     {a_label!r} @ {a_box} ↔ {text!r} @ {box}"
-                    f"  距离²={dist:.0f}"
-                )
-                if best is None or dist < best[0]:
-                    best = (dist, a_box, a_label, box, text, value)
+                if fallback is None or dist < fallback[0]:
+                    fallback = (dist, a_box, a_label, box, text, value)
 
-        assert best is not None
-        dist, anchor_box, label, box, text, value = best
+        assert fallback is not None
+        dist, anchor_box, label, box, text, value = fallback
         _state["measured"] = value
         print(
             f"[laser_sweep]   B 软件：离 {label!r} 最近的数值 {text!r}"
@@ -958,6 +1220,7 @@ class LaserReadValueB(CustomRecognition):
                 "text": text,
                 "measured": value,
                 "distance_sq": round(dist, 1),
+                "fallback": True,
             },
         )
 
