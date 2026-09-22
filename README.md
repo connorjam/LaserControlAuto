@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <img alt="LOGO" src="docs\zh_cn\develop\maalaser-logo_512.png" width="160" height="160" />
+  <img alt="LOGO" src="docs/zh_cn/develop/maalaser-logo_512.png" width="160" height="160" />
 </p>
 
 <div align="center">
@@ -23,9 +23,9 @@
 
 | 步骤 | 动作 |
 | --- | --- |
-| 1 | 在 **A 软件** 里找到目标参数（默认是 `Temperature`），把输入框清空并填入本轮数值，再点它旁边的 `Setting` 按钮 |
+| 1 | 在 **A 软件** 里**现场 OCR 定位**目标参数那一行（默认标签 `Temperature`；有同名标签时用 `near_text` 指定要哪个），清空输入框、填入本轮数值，再点同一行的 `Setting` |
 | 2 | 等待一段时间（默认 10 秒），让设备稳定下来 |
-| 3 | 到 **B 软件** 里找指定标签（默认是 `Wavelength`）**最近的**那个数值，读出来 |
+| 3 | 到 **B 软件** 里读指定标签**旁边**的数值（默认标签 `功率CH1`；标签右边同一行、或标签正下方都认） |
 | 4 | 把「序号 / 设定参数 / 测量值 / 时间」追加写入 CSV |
 | 5 | 换下一个参数，回到第 1 步 |
 
@@ -66,8 +66,11 @@
 
 | 序号 | 设定参数 | B软件测量值 | 时间 |
 | --- | --- | --- | --- |
-| 1 | 20 | 1061 | 2026-09-21 16:40:12 |
-| 2 | 21 | 1062 | 2026-09-21 16:40:35 |
+| 1 | 20 | -79.72 | 2026-09-22 16:51:25 |
+| 2 | 25 | -79.94 | 2026-09-22 16:51:32 |
+| 3 | 30 | -80.11 | 2026-09-22 16:51:58 |
+
+（数值随设定参数变化，这里只是示意；GaussianBeam 那类 B 软件读到的会是 `1061` 这样的波长值。）
 
 某一轮读数失败时会写一行空值占位，保证行号和参数一一对应，不会错位。
 
@@ -82,9 +85,12 @@
 | 提示找不到窗口 | 窗口标题变了，见下面「换成别的软件」 |
 | 数值一直读不到 | B 软件窗口没开，或者标签文字不对 |
 | CSV 里测量值全是空的 | 读数失败，看日志里的 OCR 结果 |
+| A 软件的参数没被改，或点到别处去了 | 看日志面板里 `[laser_sweep]` 那几行：`锚点候选` / `按钮候选` / `点击 (x, y)` 会说明它选了谁、点在哪；选错就用 `near_text` 指定标签 |
+| 日志里一条 `[laser_sweep]` 都没有 | 用的是 v1.0.4 之前的老包（stdout 被块缓冲吃掉，打印刷不出来），换新版即可 |
 | 报「应用程序无法正常启动」 | 装 VC++ 运行库 |
 
-日志位置：`debug/maafw.log`，以及通用 UI 的运行日志面板。
+日志位置：通用 UI 的运行日志面板（agent 的调试打印都以 `[laser_sweep]` 开头），
+以及 `debug/maafw.log`（框架层细节）。
 
 ---
 
@@ -120,6 +126,7 @@
 | --- | --- |
 | `interface.json` → `controller[].win32.window_regex` | A 软件的窗口标题 |
 | `my_task.json` → `LaserSweepFindTemperature` 的 `anchor_text` | 参数的标签文字 |
+| （可选）`LaserSweepFindTemperature` 的 `near_text` | 界面上有多个同名标签时，钦定「离它最近」的那一个 |
 
 **不需要量任何坐标、比例或 `roi`**：
 
@@ -142,11 +149,16 @@
 `near_text` 没命中时日志里会打 ⚠️ 并退回旧逻辑；每次运行还会打印
 `锚点候选：...` 和 `按 near_text=... 钦定锚点 ...`，对着日志就能确认选对没有。
 
-> **标签和数值都只认「短文本」**（`anchor_max_chars` / `value_max_chars` /
-> `min_digit_ratio`）。界面上的 Tips、日志行动辄几十个字，只要含关键词就会
-> 冒充成标签或数值 —— 2026-09-22 分别被
-> `Tips：Setting TEC Temperature Successfully!` 和
-> `Start Wavelength 1548.000000rm not in range[...],please check!` 各坑过一次。
+> **标签、按钮、数值三者都只认「短文本」**
+> （`anchor_max_chars` / `target_max_chars` / `value_max_chars` / `min_digit_ratio`）。
+> 界面上的 Tips、日志行动辄几十个字，只要含关键词就会冒充成标签、按钮或数值。
+> 2026-09-22 换电脑后连吃两次：`Start Wavelength 1548.000000rm not in range[...]`
+> 冒充成 B 软件的标签；而 `Tips：Setting TEC Temperature Successfully!`
+> 一行**同时**冒充了 A 软件的标签和 `Setting` 按钮 —— 它俩的关键词都在里面，
+> 距离还比真控件近。
+>
+> 日志里 `锚点候选` / `按钮候选` 会列出过滤后的名单，
+> 跑一轮就知道有没有漏网的。
 
 ---
 
@@ -157,10 +169,14 @@
 两条路：
 
 - **本地打包**：准备 `deps/`（MaaFramework）+ `MFA/`（MFAAvalonia），
-  跑 `python tools/prepare_embedded_python.py`，再跑 `python tools/install.py v1.0.1 win x86_64`，
-  最后 `python tools/pack_zip.py` 打出 `dist/LaserControlAuto-win-x86_64-v1.0.1.zip`
-- **CI 自动打包**：打一个 `v1.0.2` 标签推上去，
+  跑 `python tools/prepare_embedded_python.py`，再跑 `python tools/install.py v1.0.5 win x86_64`，
+  最后 `python tools/pack_zip.py` 打出 `dist/LaserControlAuto-win-x86_64-v1.0.5.zip`
+- **CI 自动打包**：打一个 `v1.0.5` 标签推上去，
   GitHub Actions 会自动打包 **Windows x64 版**并创建 Release
+
+> 只是修了 agent / 流水线的一两个文件时，不必重发整个包：
+> 直接让使用者用新文件覆盖 `agent/laser_sweep.py`、`resource/pipeline/my_task.json` 更快
+> （记得核对字节数，日志里会打印 agent 文件的指纹）。
 
 ---
 
@@ -181,6 +197,7 @@ LaserControlAuto/
 │   ├── install.py                  ← 打包脚本
 │   ├── pack_zip.py                 ← 把 install/ 打成 dist/ 里的发布 zip
 │   ├── prepare_embedded_python.py  ← 准备便携版 Python
+│   ├── check_pickers.py            ← 定位逻辑自检（不连软件，改完跑一下）
 │   └── configure.py                ← OCR 模型配置
 ├── docs/                           ← 文档
 └── .github/workflows/              ← CI：检查 + 自动发版
