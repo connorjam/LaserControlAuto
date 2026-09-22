@@ -6,9 +6,19 @@
     "label": "激光控制自动化",
     "description": "在低噪声驱动调试软件里自动设置参数，等待稳定后到测量软件读取数值，逐点记录到 CSV。",
     "license": "MIT",
-    "welcome": [
-        "## 使用前请先确认\n\n1. **A 软件**（要设置参数的那个）已经打开，并且停在含目标参数的那一页。\n2. **B 软件**（要读数值的那个）也已经打开。\n3. 在下面的「扫描设置」里填好**起始值 / 结束值 / 步长**和**输出文件夹**。\n\n点「开始任务」后程序会自动完成整个扫描，期间请不要用手去动鼠标键盘。\n\n结果会保存成 CSV 文件，路径在运行日志里会打印出来。"
-    ],
+    // ⚠️ welcome 只能写成「一个字符串」，千万别写成字符串数组 ["...", "..."]。
+    //    2026-09-22 踩过的坑：
+    //      协议 v2.10.2 起确实允许数组写法，本文件的 schema 校验也放行，
+    //      但 MFAAvalonia v2.16.1 的 MaaWelcomeConverter 只认「字符串」和
+    //      「对象数组」（元素形如 {"label": "...", "content": "..."}）。
+    //      写成字符串数组会抛：
+    //          Newtonsoft.Json.JsonSerializationException:
+    //          welcome announcement entries must be objects.
+    //      后果是整个 interface.json 加载失败 —— 界面上「任务列表」一片空白、
+    //      点「+」也没有任务可加、日志区红字「文件 interface.json 加载失败！」。
+    //    要写多条公告，就全塞进这一个字符串里，中间用 --- 分隔。
+    //    tools/install.py 里已经加了自检：真写成数组会在打包时自动降级并告警。
+    "welcome": "## 使用前请先确认\n\n1. **A 软件**（要设置参数的那个）已经打开，并且停在含目标参数的那一页。\n2. **B 软件**（要读数值的那个）也已经打开。\n3. 在下面的「扫描设置」里填好**起始值 / 结束值 / 步长**和**输出文件夹**。\n\n点「开始任务」后程序会自动完成整个扫描，期间请不要用手去动鼠标键盘。\n\n结果会保存成 CSV 文件，路径在运行日志里会打印出来。",
     "version": "1.0.0",
     "contact": "https://github.com/connorjam/LaserControlAuto",
     "github": "https://github.com/connorjam/LaserControlAuto",

@@ -269,6 +269,56 @@ deps\python\python.exe -m pip install "maafw==5.13.1"
 
    打印 `ok` 就说明解释器和依赖都没问题。
 
+### 打包后打开软件，「任务列表」一片空白、点 + 也没任务可加
+
+2026-09-22 遇到过一次。日志面板里是一行红字：
+
+```
+[ERR] [cfg=Default] 加载界面资源定义失败：file=interface.json,
+      reason=Failed to load interface file：...\install\interface.json
+```
+
+但**真正的异常在更上面几行**（同一个日志文件的开头部分）：
+
+```
+Newtonsoft.Json.JsonSerializationException: welcome announcement entries must be objects.
+   at MFAAvalonia.Helper.Converters.MaaWelcomeConverter.ReadJson(...)
+```
+
+**原因**：`welcome` 被写成了字符串数组。
+
+```jsonc
+"welcome": ["第一条公告", "第二条公告"]   // ❌ MFAAvalonia v2.16.1 直接报错
+```
+
+ProjectInterface V2 协议从 v2.10.2 起确实允许数组写法，`tools/validate_schema.py`
+的 schema 校验也放行（schema 里 `welcome` 就是 `string | string[]`），
+但 MFAAvalonia v2.16.1 的 `MaaWelcomeConverter` 只认两种：
+
+- 一个字符串：`"welcome": "公告正文"`
+- 对象数组：`"welcome": [{"label": "标题", "content": "正文"}]`
+
+它抛出的异常会让**整个 interface.json 加载失败**，于是任务、控制器、扫描设置
+在界面上全部消失 —— 看上去就像「这软件没有任务」，其实只是公告写法不对。
+
+**处理**：
+
+```jsonc
+// ✅ 正确写法；要多条公告就都塞进这一个字符串，用 --- 分隔
+"welcome": "第一条公告\n\n---\n\n第二条公告"
+```
+
+`tools/install.py` 现在会在打包时自检：发现字符串数组会自动合并成一条并打印告警
+（`⚠️ welcome 写成了字符串数组…`），所以重跑一次就行：
+
+```powershell
+python tools\install.py v1.0.0 win x86_64
+```
+
+> **怎么确认 interface.json 真的被读进去了**：看日志里有没有
+> `[Interface] 预加载完成，耗时 xx ms`。没有这行 = 加载失败，
+> 界面上一定缺任务。
+
 ### 换电脑后坐标对不上怎么办
 
 不需要重调 `roi`——本项目的定位用的是「配对法」（找离标签最近的按钮 / 数值），
