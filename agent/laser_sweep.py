@@ -42,6 +42,12 @@ DEFAULT_CSV_NAME = "laser_sweep_result.csv"
 DEFAULT_HEADER = ["序号", "设定参数", "B软件测量值", "时间"]
 DEFAULT_PATTERN = r"[-+]?\d+(?:\.\d+)?"
 
+# 标签和数值都应该是「短文本」。界面上的日志/提示行动辄几十个字，
+# 它们只要含有关键词就会冒充成标签，把整条定位链带偏（见 _short_hits）。
+DEFAULT_ANCHOR_MAX_CHARS = 16  # "Temperature:"=12、"功率CH1"=6、"Wavelength"=10 都在内
+DEFAULT_VALUE_MAX_CHARS = 24  # "-79.720dBm"=10、"1061 nm"=7 都在内
+DEFAULT_MIN_DIGIT_RATIO = 0.3  # 数值文本里数字字符的最低占比
+
 # 跨节点共享的运行状态；每次 laser_sweep_begin 都会整体重置
 _state: dict[str, Any] = {
     "values": [],  # ["20", "21", ..., "30"]
@@ -423,6 +429,47 @@ def _anchor_texts(param: dict[str, Any], key: str = "anchor_text") -> list[str]:
         return [str(item).strip() for item in raw if str(item).strip()]
     text = str(raw).strip()
     return [text] if text else []
+
+
+def _short_hits(
+    hits: list[tuple[tuple[int, int, int, int], str]],
+    max_chars: int,
+    label: str = "",
+) -> list[tuple[tuple[int, int, int, int], str]]:
+    """只留「短文本」，把日志行那种长句子挡在门外。
+
+    2026-09-22 换电脑后连踩两回，根子都在这里：
+
+      · A 软件下方有一行提示
+        `[2026.09.22-15:49:35] Tips：Setting TEC Temperature Successfully!`
+        它**包含** "Temperature"，于是冒充成参数标签、还把配对逻辑带偏，
+        最后点到 (228, 420) 这种莫名其妙的位置；
+      · B 软件下方是日志区，OCR 认出
+        `Start Wavelength 1548.000000rm not in range[...],please check!`
+        它**包含** "Wavelength"，冒充成锚点之后，紧挨着它下一行的
+        `code=-1073807265, VISA Write in ...`（边缘间距 1px）就被当成了数值。
+
+    真标签、真数值都是短文本，所以按字数直接卡一刀最省事。
+    """
+    if max_chars <= 0:
+        return hits
+    kept = [(box, text) for box, text in hits if len(text.strip()) <= max_chars]
+    if label and len(kept) != len(hits):
+        print(f"[laser_sweep]   {label}：滤掉 {len(hits) - len(kept)} 条超过 {max_chars} 字的长文本")
+    return kept
+
+
+def _digit_ratio(text: str) -> float:
+    """数字字符占全文的比例，用来判断「这段话像不像一个数值」。
+
+        '-79.720dBm'                          → 6/10 ≈ 0.60  ✔
+        '1061 nm'                             → 4/7  ≈ 0.57  ✔
+        'code=-1073807265, VISA Write in ...' → 10/90 ≈ 0.11 ✘ 一眼是日志
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0.0
+    return sum(ch.isdigit() for ch in stripped) / len(stripped)
 
 
 def _append_row(measured: Optional[float]) -> bool:
@@ -948,6 +995,14 @@ class LaserFindNearestSetting(CustomRecognition):
         roi = param.get("roi") or [0, 0, 0, 0]
         anchor_texts = _anchor_texts(param) or ["Temperature"]
         target_text = str(param.get("target_text") or "Setting")
+        # 界面上有多个同名标签时的钦定方式（二选一）：
+        #   near_text    —— 取「离这个词最近」的那个标签（推荐，换分辨率也不受影响）
+        #   anchor_index —— 按「从上到下、从左到右」直接点第几个（0 = 第一个）
+        # near_text 也支持写数组，OCR 少认一个空格时可以多写几种写法兜着。
+        near_texts = _anchor_texts(param, "near_text")
+        anchor_index = param.get("anchor_index")
+        # 标签一定是短文本；界面上那些 Tips / 日志行长得很像标签，必须挡掉
+        anchor_max_chars = int(param.get("anchor_max_chars", DEFAULT_ANCHOR_MAX_CHARS))
         # "target"（默认）返回离锚点最近的按钮；"anchor" 返回那个锚点本身；
         # "input" 返回「标签与按钮之间」那个输入框的位置（每次执行都重新 OCR 定位，
         # 不依赖任何写死的比例，换电脑/换分辨率都能自己跟上）。
@@ -964,7 +1019,7 @@ class LaserFindNearestSetting(CustomRecognition):
                 detail={"error": "这一屏没有 OCR 到任何文字"},
             )
 
-        anchors = _match_text(raw, anchor_texts)
+        anchors = _short_hits(_match_text(raw, anchor_texts), anchor_max_chars, "锚点")
         if not anchors:
             return CustomRecognition.AnalyzeResult(
                 box=None,
@@ -973,6 +1028,51 @@ class LaserFindNearestSetting(CustomRecognition):
                     "ocr_texts": [t for _, t in raw],
                 },
             )
+
+        print(
+            "[laser_sweep]   锚点候选："
+            + "；".join(f"{text!r}@({box[0]},{box[1]})" for box, text in anchors[:8])
+        )
+
+        # ── 同名标签太多时，用参照词钦定 ──────────────────────────────────
+        if near_texts and len(anchors) > 1:
+            hints = _short_hits(
+                _match_text(raw, near_texts), max(anchor_max_chars, 32), "参照词"
+            )
+            if hints:
+                def _hint_gap(item: tuple[tuple[int, int, int, int], str]) -> float:
+                    return min(_distance_sq(item[0], hint_box) for hint_box, _ in hints)
+
+                anchors.sort(key=_hint_gap)
+                chosen_box, chosen_text = anchors[0]
+                print(
+                    f"[laser_sweep]   按 near_text={near_texts!r} 钦定锚点 {chosen_text!r} @ {chosen_box}"
+                    f"（参照词命中 {len(hints)} 处："
+                    + "；".join(f"{t!r}@({b[0]},{b[1]})" for b, t in hints[:4])
+                    + "）"
+                )
+                anchors = [anchors[0]]
+            else:
+                print(
+                    f"[laser_sweep]   ⚠️ 没找到参照词 {near_texts!r}，"
+                    "退回按「与按钮的配对距离」挑，可能挑错行"
+                )
+
+        # ── 或者干脆数着来：0 = 最上面那个 ────────────────────────────────
+        if anchor_index is not None:
+            ordered = sorted(anchors, key=lambda item: (item[0][1], item[0][0]))
+            try:
+                wanted_index = int(anchor_index)
+            except (TypeError, ValueError):
+                wanted_index = -1
+            if 0 <= wanted_index < len(ordered):
+                anchors = [ordered[wanted_index]]
+                print(
+                    f"[laser_sweep]   按 anchor_index={wanted_index} 直接钦定 "
+                    f"{ordered[wanted_index][1]!r} @ {ordered[wanted_index][0]}"
+                )
+            else:
+                print(f"[laser_sweep]   ⚠️ anchor_index={anchor_index} 越界（共 {len(ordered)} 个锚点），已忽略")
 
         candidates = _match_text(raw, [target_text])
         if not candidates:
@@ -1103,18 +1203,38 @@ class LaserReadValueB(CustomRecognition):
             )
 
         pattern = re.compile(str(param.get("pattern") or DEFAULT_PATTERN))
+        value_max_chars = int(param.get("value_max_chars", DEFAULT_VALUE_MAX_CHARS))
+        min_digit_ratio = float(param.get("min_digit_ratio", DEFAULT_MIN_DIGIT_RATIO))
 
-        # 候选 = 能从中解析出数字的 OCR 结果
+        # 候选 = 既能解析出数字、又「长得像数值」的 OCR 结果。
+        # 光有数字是不够的：B 软件下方日志区那行
+        #   "code=-1073807265, VISA Write in MY TSL-510_Initialize.vi->..."
+        # 也含数字，而且紧贴着上一行（边缘间距只有 1px），
+        # 不把这种长句子挡掉，它就会以 1px 的优势抢走真正的 -79.720dBm。
         candidates: list[tuple[tuple, str, float]] = []
+        skipped: list[str] = []
         for box, text in hits:
             match = pattern.search(text)
-            if match is not None:
-                candidates.append((box, text, float(match.group())))
+            if match is None:
+                continue
+            stripped = text.strip()
+            if len(stripped) > value_max_chars or _digit_ratio(stripped) < min_digit_ratio:
+                skipped.append(stripped)
+                continue
+            candidates.append((box, text, float(match.group())))
+
+        if skipped:
+            print(
+                f"[laser_sweep]   按「≤{value_max_chars} 字 且 数字占比 ≥{min_digit_ratio:.2f}」"
+                f"滤掉 {len(skipped)} 条不像数值的文本"
+            )
 
         if not candidates:
             return CustomRecognition.AnalyzeResult(
                 box=None,
-                detail={"error": f"识别到的内容里没有数字: {[t for _, t in hits]}"},
+                detail={
+                    "error": f"识别到的内容里没有像数值的文本: {[t for _, t in hits][:12]}",
+                },
             )
 
         if not anchor_texts:
@@ -1127,7 +1247,11 @@ class LaserReadValueB(CustomRecognition):
             )
 
         # ---- 找 anchor_text 旁边的那个数值 ----
-        anchors = _match_text(hits, anchor_texts)
+        # 锚点同样只认短文本：B 软件日志区的
+        #   "Start Wavelength 1548.000000rm not in range[...],please check!"
+        # 含 "Wavelength"，不挡掉就会冒充成锚点。
+        anchor_max_chars = int(param.get("anchor_max_chars", DEFAULT_ANCHOR_MAX_CHARS))
+        anchors = _short_hits(_match_text(hits, anchor_texts), anchor_max_chars, "锚点")
         if not anchors:
             return CustomRecognition.AnalyzeResult(
                 box=None,
@@ -1136,6 +1260,11 @@ class LaserReadValueB(CustomRecognition):
                     "ocr_texts": [t for _, t in hits],
                 },
             )
+
+        print(
+            "[laser_sweep]   锚点候选："
+            + "；".join(f"{text!r}@({box[0]},{box[1]})" for box, text in anchors[:8])
+        )
 
         # 位置感知的挑选：先「锚点右侧同一行」，再「锚点正下方同一列」，
         # 两条都不成立才退回「中心距离最近」。

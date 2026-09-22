@@ -106,6 +106,17 @@
             //    所以窗口尺寸 / DPI 怎么变都不用改配置，换电脑也不会点偏。
             //    可选值：input（输入框）/ anchor（标签本身）/ target（按钮）
             "return_box": "input",
+
+            // ★ 界面上有多个 "Temperature" 时，用参照词钦定要用哪一个：
+            //    取「离这个词最近」的那个标签（推荐，换分辨率也不会跑偏）。
+            //    OCR 有时会把空格吃掉，所以可以写数组多给几种写法。
+            //    也可以改用 "anchor_index": 1 —— 按「从上到下、从左到右」数，0 是第一个。
+            "near_text": ["Module Config", "ModuleConfig"],
+
+            // 标签只认短文本：界面上那些 Tips / 日志行动辄几十个字，
+            // 一旦含 "Temperature" 就会冒充成标签（2026-09-22 实测被它带偏过）。
+            "anchor_max_chars": 16,
+
             "roi": [0, 0, 0, 0],
             "ocr_node": "LaserSweepOcrSetting"
         },
@@ -311,6 +322,19 @@
 
             // 数值解析正则，默认抓第一个数字（含小数、正负号）
             "pattern": "[-+]?\\d+(?:\\.\\d+)?",
+
+            // ★ 数值候选必须「短」且「以数字为主」：
+            //    B 软件下方是日志区，OCR 会认出
+            //      "code=-1073807265, VISA Write in MY TSL-510_Initialize.vi->..."
+            //    这种长句子 —— 它也含数字，还紧贴着上一行（边缘间距只有 1px），
+            //    不挡掉就会以 1px 的优势抢走真正的 -79.720dBm（2026-09-22 实测）。
+            //    "-79.720dBm" = 10 字 / 数字占比 0.6，"1061 nm" = 7 字 / 0.57，都在范围内。
+            "value_max_chars": 24,
+            "min_digit_ratio": 0.3,
+
+            // 锚点同样只认短文本，免得日志行里的 "Wavelength" 冒充标签
+            "anchor_max_chars": 16,
+
             "ocr_node": "LaserSweepOcrValueB",
             // 要找「离某词最近的数值」就必须做检测+识别，不能只识别
             "only_rec": false

@@ -181,6 +181,62 @@ check("空值", laser_sweep._anchor_texts({}) == [])
 
 print()
 print("=" * 78)
+print("⑤ 长文本必须被挡掉（A 软件的 Tips 行 / B 软件的日志行 —— 真实日志数据）")
+print("=" * 78)
+tips_line = "[2026.09.22-15:49:35] Tips：Setting TEC Temperature Successfully!"
+label_hits = [
+    ((40, 417, 97, 23), "Temperature"),
+    ((497, 293, 95, 16), "Temperature:"),
+    ((280, 410, 456, 20), tips_line),  # ← 冒充成 Temperature 标签的那行提示
+]
+matched = laser_sweep._match_text(label_hits, ["Temperature"])
+check("裸匹配确实会把 Tips 行也算进来（说明这道护栏有必要）", len(matched) == 3)
+kept = laser_sweep._short_hits(matched, laser_sweep.DEFAULT_ANCHOR_MAX_CHARS)
+check("按长度过滤后只剩两个真标签", len(kept) == 2 and all(t != tips_line for _, t in kept),
+      str([t for _, t in kept]))
+
+wavelength_line = "Start Wavelength 1548.000000rm not in range[0.000000,0.000000],please check!"
+wl_matched = laser_sweep._match_text([((745, 297, 473, 14), wavelength_line)], ["Wavelength"])
+check("B 软件日志行也会冒充 'Wavelength'", len(wl_matched) == 1)
+check("同样被长度过滤剔除",
+      laser_sweep._short_hits(wl_matched, laser_sweep.DEFAULT_ANCHOR_MAX_CHARS) == [])
+
+print()
+print("=" * 78)
+print("⑥ 数值候选必须「长得像数值」（真实日志数据）")
+print("=" * 78)
+value_samples = [
+    ((850, 84, 132, 24), "-79.720dBm", True),
+    ((640, 322, 70, 18), "1061 nm", True),
+    ((742, 312, 554, 20),
+     "code=-1073807265, VISA Write in MY TSL-510_Initialize.vi->my TSL-550 init combine.vi->TSL", False),
+    ((745, 297, 473, 14), wavelength_line, False),
+]
+for _box, text, should_keep in value_samples:
+    kept_ok = (
+        len(text.strip()) <= laser_sweep.DEFAULT_VALUE_MAX_CHARS
+        and laser_sweep._digit_ratio(text) >= laser_sweep.DEFAULT_MIN_DIGIT_RATIO
+    )
+    check(
+        f"{'保留' if should_keep else '剔除'} {text[:32]!r}",
+        kept_ok == should_keep,
+        f"长度 {len(text.strip())}，数字占比 {laser_sweep._digit_ratio(text):.2f}",
+    )
+
+print()
+print("=" * 78)
+print("⑦ near_text：多个同名标签时按「离参照词最近」钦定")
+print("=" * 78)
+module_config = (620, 180, 130, 18)  # 假设 Module Config 在面板上方
+two_labels = [((40, 417, 97, 23), "Temperature"), ((497, 293, 95, 16), "Temperature:")]
+ordered = sorted(
+    two_labels, key=lambda item: laser_sweep._distance_sq(item[0], module_config)
+)
+check("靠上的那个（离 Module Config 更近）被排到第一", ordered[0][1] == "Temperature:",
+      f"选中 {ordered[0][1]!r} @ {ordered[0][0]}")
+
+print()
+print("=" * 78)
 print(f"结果：{'全部通过 🎉' if failures == 0 else f'{failures} 项失败'}")
 print("=" * 78)
 sys.exit(1 if failures else 0)

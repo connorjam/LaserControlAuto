@@ -130,6 +130,24 @@
 所以窗口大小、分辨率、DPI 怎么变都不用改配置。
 （v1.0.2 之前是「标签中心 + 窗口宽度 × 比例」，换台电脑窗口一小就点偏了。）
 
+**界面里有多个同名标签时**（比如两个 `Temperature`），告诉程序该用哪一个：
+
+```jsonc
+"anchor_text": "Temperature",
+"near_text": ["Module Config", "ModuleConfig"],  // 取「离它最近」的那个标签
+// 或者干脆数着来：
+// "anchor_index": 1,                            // 从上到下第 2 个（0 = 第一个）
+```
+
+`near_text` 没命中时日志里会打 ⚠️ 并退回旧逻辑；每次运行还会打印
+`锚点候选：...` 和 `按 near_text=... 钦定锚点 ...`，对着日志就能确认选对没有。
+
+> **标签和数值都只认「短文本」**（`anchor_max_chars` / `value_max_chars` /
+> `min_digit_ratio`）。界面上的 Tips、日志行动辄几十个字，只要含关键词就会
+> 冒充成标签或数值 —— 2026-09-22 分别被
+> `Tips：Setting TEC Temperature Successfully!` 和
+> `Start Wavelength 1548.000000rm not in range[...],please check!` 各坑过一次。
+
 ---
 
 ## 给开发者：怎么打包
