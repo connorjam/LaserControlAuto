@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <p align="center">
-  <img alt="LOGO" src="https://cdn.jsdelivr.net/gh/MaaAssistantArknights/design@main/v1/icons/maa-logo_512x512.png" width="160" height="160" />
+  <img alt="LOGO" src="docs\zh_cn\develop\maalaser-logo_512.png" width="160" height="160" />
 </p>
 
 <div align="center">
