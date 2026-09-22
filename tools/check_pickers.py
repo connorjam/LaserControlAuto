@@ -225,15 +225,24 @@ for _box, text, should_keep in value_samples:
 
 print()
 print("=" * 78)
-print("⑦ near_text：多个同名标签时按「离参照词最近」钦定")
+print("⑦ near_text：A 软件「左侧板」vs「Module Config 面板」（真实界面坐标）")
 print("=" * 78)
-module_config = (620, 180, 130, 18)  # 假设 Module Config 在面板上方
-two_labels = [((40, 417, 97, 23), "Temperature"), ((497, 293, 95, 16), "Temperature:")]
-ordered = sorted(
-    two_labels, key=lambda item: laser_sweep._distance_sq(item[0], module_config)
+left_panel_temp = ((40, 417, 97, 23), "Temperature")  # 左侧板 Laser → Temperature
+module_cfg_temp = ((497, 293, 95, 16), "Temperature:")  # Module Config 面板里的那个
+setting_button = (726, 292, 61, 20)  # 面板里的 Setting 按钮
+module_config_hint = ((500, 40, 140, 18), "Module Config")  # 面板标题
+
+both = [left_panel_temp, module_cfg_temp]
+picked = laser_sweep._choose_anchor_by_hint(both, [module_config_hint])
+check("near_text 选中 Module Config 面板里的那个", picked[1] == "Temperature:",
+      f"{picked[1]!r} @ {picked[0]}")
+
+# 就算 near_text 没命中（比如 OCR 没认出面板标题），配对逻辑也该指向同一个
+nearest_by_button = min(
+    both, key=lambda item: laser_sweep._distance_sq(item[0], setting_button)
 )
-check("靠上的那个（离 Module Config 更近）被排到第一", ordered[0][1] == "Temperature:",
-      f"选中 {ordered[0][1]!r} @ {ordered[0][0]}")
+check("兜底：与 Setting 按钮配对同样指向它", nearest_by_button[1] == "Temperature:",
+      f"{nearest_by_button[1]!r} @ {nearest_by_button[0]}")
 
 print()
 print("=" * 78)

@@ -36,6 +36,18 @@ from maa.context import Context
 from maa.custom_action import CustomAction
 from maa.custom_recognition import CustomRecognition
 
+# ── 让每条 print 立刻进日志 ────────────────────────────────────────────────
+# AgentServer 把子进程的 stdout 接到框架日志管道上，但 Python 默认是块缓冲：
+# 输出要攒够 8KB 才真正写出去。表现就是任务跑完了、界面看着一切正常，
+# 日志里却一条 [laser_sweep] 都搜不到 —— 2026-09-22 排查时被这个坑了半天
+# （16:40 那次运行就是这样，整轮下来零条记录，只能靠猜）。
+# 改成行缓冲后，每条打印都能实时看到。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):  # 极老的解释器 / 已被替换成非文本流
+    pass
+
 # 默认值（可被流水线里的 custom_*_param 覆盖）
 DEFAULT_CSV_DIR = "./output"  # 相对 interface.json 所在目录
 DEFAULT_CSV_NAME = "laser_sweep_result.csv"
@@ -89,6 +101,21 @@ def _fmt(value: float) -> str:
     if abs(rounded - round(rounded)) < 1e-9:
         return str(int(round(rounded)))
     return repr(rounded)
+
+
+def _agent_fingerprint() -> str:
+    """报出「这次跑的到底是哪份 agent 文件」—— 路径、字节数、修改时间。
+
+    换电脑排查时最常听到的一句话是「我替换过了呀」。日志里带上这三样，
+    跟本地 `Get-Item … | Select Length, LastWriteTime` 一对就知道换没换成功。
+    """
+    try:
+        path = Path(__file__).resolve()
+        stat = path.stat()
+        stamp = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        return f"{path}（{stat.st_size} 字节，改于 {stamp}）"
+    except OSError:
+        return str(__file__)
 
 
 def _resolve(path_like: str) -> Path:
@@ -472,6 +499,28 @@ def _digit_ratio(text: str) -> float:
     return sum(ch.isdigit() for ch in stripped) / len(stripped)
 
 
+def _choose_anchor_by_hint(
+    anchors: list[tuple[tuple[int, int, int, int], str]],
+    hints: list[tuple[tuple[int, int, int, int], str]],
+) -> tuple[tuple[int, int, int, int], str]:
+    """多个同名标签里，挑「离参照词最近」的那一个。
+
+    参照词可能命中多处（标题栏、菜单、提示里都写了同一个词），
+    所以比的是「到这个词最近那一处的距离」。
+
+    实测场景（A 软件低噪声驱动调试软件）：
+        左侧板 "Laser → Temperature"        @ (40, 417)
+        Module Config 面板里的 "Temperature:" @ (497, 293)   ← 要的是这个
+        near_text = "Module Config"（面板标题，约在 y≈40 上方）
+    取距离最近的那个即可，换分辨率也不用重配。
+    """
+
+    def gap(item: tuple[tuple[int, int, int, int], str]) -> float:
+        return min(_distance_sq(item[0], hint_box) for hint_box, _ in hints)
+
+    return min(anchors, key=gap)
+
+
 def _append_row(measured: Optional[float]) -> bool:
     """把当前这一组结果追加写入 CSV。"""
     csv_path = _state.get("csv_path")
@@ -837,6 +886,11 @@ class LaserSweepBegin(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
         param = _param(argv.custom_action_param)
 
+        # 先把「这次跑的到底是哪份代码」写进日志。
+        # 换机排查时最怕的就是「文件到底替换成功没有」—— 带上文件名、字节数和
+        # 修改时间，一眼就能跟手头那份对上（2026-09-22 就为这个来回猜过一轮）。
+        print(f"[laser_sweep] agent 文件：{_agent_fingerprint()}")
+
         start = float(param.get("start", 20))
         end = float(param.get("end", 30))
         step = float(param.get("step", 1))
@@ -1011,6 +1065,13 @@ class LaserFindNearestSetting(CustomRecognition):
         # 记下当前截图的尺寸，仅作日志/兜底用；定位本身已经不依赖它了
         _remember_image_size(argv.image)
 
+        # 把这次真正生效的定位配置打出来：万一流水线没换成新版，
+        # 日志里一眼就能看出来（near_text 缺失 = pipeline 还是旧的）
+        print(
+            f"[laser_sweep]   定位参数：anchor_text={anchor_texts!r} target_text={target_text!r} "
+            f"return_box={return_box} near_text={near_texts!r} anchor_max_chars={anchor_max_chars}"
+        )
+
         # 这两个词都要做「检测 + 识别」，所以 only_rec 必须是 False
         raw = _ocr_hits(context, argv.image, ocr_node, [], roi, only_rec=False)
         if not raw:
@@ -1040,18 +1101,14 @@ class LaserFindNearestSetting(CustomRecognition):
                 _match_text(raw, near_texts), max(anchor_max_chars, 32), "参照词"
             )
             if hints:
-                def _hint_gap(item: tuple[tuple[int, int, int, int], str]) -> float:
-                    return min(_distance_sq(item[0], hint_box) for hint_box, _ in hints)
-
-                anchors.sort(key=_hint_gap)
-                chosen_box, chosen_text = anchors[0]
+                chosen_box, chosen_text = _choose_anchor_by_hint(anchors, hints)
                 print(
                     f"[laser_sweep]   按 near_text={near_texts!r} 钦定锚点 {chosen_text!r} @ {chosen_box}"
                     f"（参照词命中 {len(hints)} 处："
                     + "；".join(f"{t!r}@({b[0]},{b[1]})" for b, t in hints[:4])
                     + "）"
                 )
-                anchors = [anchors[0]]
+                anchors = [(chosen_box, chosen_text)]
             else:
                 print(
                     f"[laser_sweep]   ⚠️ 没找到参照词 {near_texts!r}，"
