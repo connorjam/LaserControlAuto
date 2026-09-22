@@ -61,7 +61,12 @@ install/
 
 ## 方式一：CI 自动打包（推荐）
 
-GitHub Actions 已经配好了，打一个 tag 就会自动为多平台打包并发 Release。
+GitHub Actions 已经配好了，打一个 tag 就会自动打包并发 Release。
+
+> **只发 Windows x64 版**。A/B 软件本身是 Windows 程序，通用 UI 也只有
+> Windows/macOS/Linux 版，别的平台打出来的包对用户没用，所以
+> `.github/workflows/install.yml` 的 matrix 里只留了 `win` / `x86_64`。
+> 以后要加平台，把 `os` / `arch` 数组补回去就行（各步骤的 `if` 判断都还在）。
 
 ### 一次性准备
 
@@ -74,22 +79,26 @@ GitHub Actions 已经配好了，打一个 tag 就会自动为多平台打包并
 
 ```bash
 git add .
-git commit -m "v1.0.0 发布"
-git tag v1.0.0          # 版本号自己定，必须以 v 开头
-git push origin HEAD -u
-git push origin v1.0.0
+git commit -m "fix: 修好 xxx"
+git tag v1.0.2          # 版本号自己定，必须以 v 开头
+git push origin main
+git push origin v1.0.2  # 推 tag 才会发 Release
 ```
 
 推上去之后：
 
 1. 打开仓库的 **Actions** 页面，能看到 `install` 工作流在跑
 2. 跑完（约 10~20 分钟）到 **Releases** 页面下载
-3. 文件名形如 `LaserControlAuto-win-x86_64-v1.0.1.zip`
+3. 文件名形如 `LaserControlAuto-win-x86_64-v1.0.2.zip`
+
+> 推普通提交（不带 tag）也会跑一遍打包，但只是验证能不能打包成功，
+> 不会创建 Release —— 想发版必须推 tag。
 
 CI 会自动完成这些事：
 
 | 步骤 | 谁做的 |
 | --- | --- |
+| 只打 Windows x64 | matrix 限定为 `os: [win]` / `arch: [x86_64]` |
 | 拉取子模块 `assets/MaaCommonAssets`（OCR 模型来源） | `actions/checkout` 的 `submodules: true` |
 | 下载 MaaFramework 原生库到 `deps/` | `robinraju/release-downloader` |
 | 下载 MFAAvalonia 到 `MFA/` | 同上 |

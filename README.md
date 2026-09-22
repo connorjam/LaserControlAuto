@@ -123,8 +123,8 @@
 - **本地打包**：准备 `deps/`（MaaFramework）+ `MFA/`（MFAAvalonia），
   跑 `python tools/prepare_embedded_python.py`，再跑 `python tools/install.py v1.0.1 win x86_64`，
   最后 `python tools/pack_zip.py` 打出 `dist/LaserControlAuto-win-x86_64-v1.0.1.zip`
-- **CI 自动打包**：打一个 `v1.0.1` 标签推上去，
-  GitHub Actions 会自动为多个平台打包并发 Release
+- **CI 自动打包**：打一个 `v1.0.2` 标签推上去，
+  GitHub Actions 会自动打包 **Windows x64 版**并创建 Release
 
 ---
 
