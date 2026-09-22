@@ -72,8 +72,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [win, macos, linux, android]
-        arch: [aarch64, x86_64]
+        # 只发 Windows x64。
+        # A/B 软件本身就是 Windows 程序，而通用 UI（MFAAvalonia）也只有
+        # Windows/macOS/Linux 版 —— 别的平台打出来的包里既没有 MFAAvalonia，
+        # 也没有便携版 Python，对用户毫无用处，只会让 Release 变乱、白跑 CI。
+        # 以后真要支持别的平台，把对应的 os/arch 加回下面两个数组即可，
+        # 各步骤上的 if 判断都还留着，不用改别处。
+        os: [win]
+        arch: [x86_64]
       fail-fast: false
 
     steps:
