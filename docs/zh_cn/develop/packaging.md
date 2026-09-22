@@ -84,7 +84,7 @@ git push origin v1.0.0
 
 1. 打开仓库的 **Actions** 页面，能看到 `install` 工作流在跑
 2. 跑完（约 10~20 分钟）到 **Releases** 页面下载
-3. 文件名形如 `MaaXXX-win-x86_64-v1.0.0.zip`
+3. 文件名形如 `LaserControlAuto-win-x86_64-v1.0.1.zip`
 
 CI 会自动完成这些事：
 
@@ -154,7 +154,7 @@ python tools\prepare_embedded_python.py
 ```powershell
 mkdir install -Force
 Copy-Item -Recurse -Force MFA\* install\
-python tools\install.py v1.0.0 win x86_64
+python tools\install.py v1.0.1 win x86_64
 ```
 
 跑完 `install/` 就是成品。日志里会出现：
@@ -172,9 +172,25 @@ cd install
 .\MFAAvalonia.exe
 ```
 
-**5. 发给别人**
+**5. 打成发布 zip**
 
-把整个 `install/` 目录压成 zip 即可。
+```powershell
+python tools\pack_zip.py
+```
+
+产物在 `dist/LaserControlAuto-win-x86_64-<版本号>.zip`，版本号默认取
+`install/interface.json` 里的 `version`（也就是第 3 步传给 `install.py` 的那个）。
+
+zip **不带 `install/` 前缀**，用户解压出来第一层就是 `MFAAvalonia.exe`；
+`config/`、`logs/`、`debug/`、`temp/` 这些运行时目录会被自动排除，
+所以不会把本机的窗口标题、任务勾选状态、日志一起发出去。
+
+> 想手动压也可以（把 `install/` 里的东西压成 zip 就行），
+> 只是记得别把 `config/`、`logs/`、`debug/`、`temp/` 带进去。
+
+**6. 发给别人**
+
+把 `dist/` 里的 zip 发出去即可。
 
 ### 本地打包时各文件的作用
 
@@ -183,6 +199,7 @@ cd install
 | `tools/fetch_binaries.py` | 下载 MaaFramework + MFAAvalonia 并解压到位 |
 | `tools/prepare_embedded_python.py` | 准备便携版 Python（产物在 `deps/python/`） |
 | `tools/install.py` | 组装 `install/`：拷原生库、资源、agent、便携版 Python，并改写 `interface.json` |
+| `tools/pack_zip.py` | 把 `install/` 打成 `dist/` 里的发布 zip（自动排除运行时目录） |
 | `tools/configure.py` | 检查 OCR 模型（已有则跳过） |
 | `.github/workflows/install.yml` | CI 版的全套流程，本地打包可以对照着看 |
 
