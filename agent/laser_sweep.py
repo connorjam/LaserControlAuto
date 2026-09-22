@@ -57,6 +57,7 @@ DEFAULT_PATTERN = r"[-+]?\d+(?:\.\d+)?"
 # 标签和数值都应该是「短文本」。界面上的日志/提示行动辄几十个字，
 # 它们只要含有关键词就会冒充成标签，把整条定位链带偏（见 _short_hits）。
 DEFAULT_ANCHOR_MAX_CHARS = 16  # "Temperature:"=12、"功率CH1"=6、"Wavelength"=10 都在内
+DEFAULT_TARGET_MAX_CHARS = 16  # 按钮文字同样是短文本："Setting"=7、"è Setting"=9
 DEFAULT_VALUE_MAX_CHARS = 24  # "-79.720dBm"=10、"1061 nm"=7 都在内
 DEFAULT_MIN_DIGIT_RATIO = 0.3  # 数值文本里数字字符的最低占比
 
@@ -1131,7 +1132,14 @@ class LaserFindNearestSetting(CustomRecognition):
             else:
                 print(f"[laser_sweep]   ⚠️ anchor_index={anchor_index} 越界（共 {len(ordered)} 个锚点），已忽略")
 
-        candidates = _match_text(raw, [target_text])
+        # 按钮候选同样只认短文本 —— 这一条是 2026-09-22 最后一环的元凶：
+        # A 软件下方那行提示
+        #   "[2026.09.22-15:49:35] Tips：Setting TEC Temperature Successfully!"
+        # 既含 "Temperature"（冒充锚点）又含 "Setting"（冒充按钮），
+        # 而且它离锚点的距离²=15493，比真按钮 (726,292) 的 44945 还近，
+        # 于是「点 Setting」变成了「点那行提示」，最后落到 (228, 420)。
+        target_max_chars = int(param.get("target_max_chars", DEFAULT_TARGET_MAX_CHARS))
+        candidates = _short_hits(_match_text(raw, [target_text]), target_max_chars, "按钮")
         if not candidates:
             return CustomRecognition.AnalyzeResult(
                 box=None,
@@ -1140,6 +1148,11 @@ class LaserFindNearestSetting(CustomRecognition):
                     "ocr_texts": [t for _, t in raw],
                 },
             )
+
+        print(
+            "[laser_sweep]   按钮候选："
+            + "；".join(f"{text!r}@({box[0]},{box[1]})" for box, text in candidates[:8])
+        )
 
         # 全局最小配对：每个锚点各自找最近的按钮，再取整体距离最小的那一对。
         # 这样做是因为界面上经常有多个同名文字（例如左侧状态栏也有一个 "Temperature"），

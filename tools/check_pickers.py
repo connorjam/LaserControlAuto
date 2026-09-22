@@ -246,6 +246,34 @@ check("兜底：与 Setting 按钮配对同样指向它", nearest_by_button[1] =
 
 print()
 print("=" * 78)
+print("⑧ 按钮候选也必须挡长文本（真实日志：Tips 行同时冒充标签和按钮）")
+print("=" * 78)
+raw_hits = [
+    ((726, 292, 61, 20), "è Setting"),  # 真按钮
+    ((280, 410, 456, 20), tips_line),  # 冒充者：既含 Temperature 又含 Setting
+    ((40, 417, 97, 23), "Temperature"),
+    ((497, 293, 95, 16), "Temperature:"),
+]
+buttons = laser_sweep._short_hits(
+    laser_sweep._match_text(raw_hits, ["Setting"]), laser_sweep.DEFAULT_TARGET_MAX_CHARS
+)
+check("按钮候选只剩真按钮", len(buttons) == 1 and buttons[0][1] == "è Setting",
+      str([t for _, t in buttons]))
+
+best_row = min(
+    [left_panel_temp, module_cfg_temp],
+    key=lambda item: laser_sweep._distance_sq(item[0], buttons[0][0]),
+)
+check("配对选中 Module Config 面板那一行", best_row[1] == "Temperature:",
+      f"{best_row[1]!r} @ {best_row[0]}")
+
+fitted = laser_sweep._input_box_between(module_cfg_temp[0], buttons[0][0], [])
+mid_x = fitted[0] + fitted[2] / 2
+check("夹出的输入框落在标签与按钮之间", 592 <= mid_x <= 726, f"中点 x = {mid_x:.0f}")
+check("不再退化成 (228,420) 那种位置", abs(mid_x - 228) > 100, f"中点 x = {mid_x:.0f}")
+
+print()
+print("=" * 78)
 print(f"结果：{'全部通过 🎉' if failures == 0 else f'{failures} 项失败'}")
 print("=" * 78)
 sys.exit(1 if failures else 0)
