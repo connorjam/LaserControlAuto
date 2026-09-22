@@ -273,6 +273,38 @@ deps\python\python.exe -m pip install "maafw==5.13.1"
 （如果你已经自己把 OCR 模型放进 `assets/resource/model/ocr/` 了，
 可以临时把 `tools/install.py` 里 `configure_ocr_model()` 那一行注释掉。）
 
+### CI 跑到最后一步失败：`Resource not accessible by integration`
+
+2026-09-22 发 v1.0.1 时遇到的。`install` 工作流前面的步骤（下载、打包、上传
+artifact）全是绿的，只有最后 `release` 那一步报：
+
+```
+Run softprops/action-gh-release@v2
+Resource not accessible by integration
+https://docs.github.com/rest/releases/releases#create-a-release
+```
+
+这是**仓库没给 Actions 写权限**，跟代码无关 —— Actions 手里那份 `GITHUB_TOKEN`
+是只读的，建不了 Release。表现很有迷惑性：Actions 页面看起来整条跑完了，
+但 Releases 页面什么都没有（连一个空 Release 都没有）。
+
+处理（一次性，只能网页操作）：
+
+1. 打开仓库的 **Settings → Actions → General**
+   （直达链接：`https://github.com/<owner>/<repo>/settings/actions`）
+2. 拉到底部的 **Workflow permissions**，选 **Read and write permissions** → **Save**
+3. 重新发一次版（权限改动对已经失败的运行不生效，得重新触发）：
+
+   ```bash
+   git tag -d v1.0.1
+   git push origin :refs/tags/v1.0.1          # 删掉远程旧标签
+   git tag -a v1.0.1 -m "v1.0.1"
+   git push origin v1.0.1                     # 重新推，触发新的运行
+   ```
+
+> 别在 Actions 页面点「Re-run failed jobs」——那会沿用**当时那次运行**的旧配置
+> （比如还带着已经精简掉的平台矩阵）。重新推 tag 才会用仓库里最新的 workflow。
+
 ### 用户那边任务启动了但什么都不做
 
 八成是 agent 子进程没起来。让用户看：
