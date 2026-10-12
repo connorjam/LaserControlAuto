@@ -13,13 +13,17 @@ maa，直接调函数、拿真实日志里的坐标当样例比对：
        而且不能被标签自身含的那个 "1" 骗到（2026-09-22 换电脑后踩的坑）；
     ② GaussianBeam 的「数值在标签正下方」依旧能选中；
     ③ A 软件用「标签 + Setting 按钮」夹输入框（输入框空 / 已有数值两种情况）；
-    ④ anchor_text 同时兼容字符串和数组两种写法。
+    ④ anchor_text 同时兼容字符串和数组两种写法；
+    ⑨ A 软件控件定位缓存：第一次 OCR 之后每轮直接复用，
+       并且过期 / 窗口尺寸变化 / use_cache=false / relocate_every 四条失效路径都要走对
+       （这条是用假 Context 数 run_recognition 调用次数来验的，不连软件也能跑）。
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -271,6 +275,143 @@ fitted = laser_sweep._input_box_between(module_cfg_temp[0], buttons[0][0], [])
 mid_x = fitted[0] + fitted[2] / 2
 check("夹出的输入框落在标签与按钮之间", 592 <= mid_x <= 726, f"中点 x = {mid_x:.0f}")
 check("不再退化成 (228,420) 那种位置", abs(mid_x - 228) > 100, f"中点 x = {mid_x:.0f}")
+
+print()
+print("=" * 78)
+print("⑨ 定位缓存：第一次全屏 OCR，之后每轮直接复用（2026-10-12 新增）")
+print("=" * 78)
+
+
+class _FakeHit:
+    def __init__(self, box, text):
+        self.box, self.text = box, text
+
+
+class _FakeReco:
+    """仿 maa 的识别结果对象：hit / all_results / filtered_results。"""
+
+    def __init__(self, hits):
+        self.hit = bool(hits)
+        self.all_results = [_FakeHit(box, text) for box, text in hits]
+        self.filtered_results = self.all_results
+        self.best_result = self.all_results[0] if self.all_results else None
+
+
+class _FakeImage:
+    """只用到 shape，numpy 的排法是 (高, 宽, 通道)。"""
+
+    def __init__(self, width=1331, height=720):
+        self.shape = (height, width, 3)
+
+
+class _FakeContext:
+    """数一数 run_recognition 被调了几次 —— 次数的减少就是省下的 OCR。"""
+
+    def __init__(self, hits):
+        self.hits, self.calls = hits, 0
+
+    def run_recognition(self, _node, _image, pipeline_override=None):
+        self.calls += 1
+        return _FakeReco(self.hits)
+
+
+class _FakeArgv:
+    def __init__(self, param, image):
+        self.custom_recognition_param = param
+        self.image = image
+        self.roi = [0, 0, image.shape[1], image.shape[0]]
+
+
+# 真实界面上的文字（含左侧板那个同名 Temperature 和面板标题）
+screen_hits = [
+    ((40, 417, 97, 23), "Temperature"),  # 左侧板：干扰项
+    ((497, 293, 95, 16), "Temperature:"),  # Module Config 面板里要用的
+    ((726, 292, 61, 20), "è Setting"),  # 真按钮
+    ((500, 40, 140, 18), "Module Config"),  # near_text 参照词
+    ((280, 410, 456, 20), tips_line),  # 冒充者：又含 Temperature 又含 Setting
+]
+
+base_param = {
+    "anchor_text": "Temperature",
+    "target_text": "Setting",
+    "near_text": ["Module Config", "ModuleConfig"],
+    "roi": [0, 0, 0, 0],
+    "ocr_node": "LaserSweepOcrSetting",
+}
+image = _FakeImage()
+expected_input = laser_sweep._input_box_between((497, 293, 95, 16), (726, 292, 61, 20), screen_hits)
+
+laser_sweep._forget_controls()
+ctx = _FakeContext(screen_hits)
+reco = laser_sweep.LaserFindNearestSetting()
+
+first = reco.analyze(ctx, _FakeArgv({**base_param, "return_box": "input"}, image))
+check("第一轮：识别出输入框", tuple(first.box) == expected_input,
+      f"{first.box} vs 期望 {expected_input}")
+check("第一轮确实跑了 OCR", ctx.calls == 1, f"调用 {ctx.calls} 次")
+check("第一轮写入了缓存", laser_sweep._controls_snapshot() is not None)
+
+second = reco.analyze(ctx, _FakeArgv({**base_param, "return_box": "target"}, image))
+check("第二轮（点 Setting）：直接吃缓存，没再 OCR", ctx.calls == 1, f"调用 {ctx.calls} 次")
+check("第二轮拿到的是按钮框", tuple(second.box) == (726, 292, 61, 20), str(second.box))
+check("第二轮的 detail 标了 cached=True", second.detail.get("cached") is True)
+
+third = reco.analyze(ctx, _FakeArgv({**base_param, "return_box": "input"}, image))
+check("第三轮（下一组的输入框）：仍然没 OCR", ctx.calls == 1, f"调用 {ctx.calls} 次")
+check("第三轮拿到的是缓存的输入框", tuple(third.box) == expected_input, str(third.box))
+check("复用次数在累加", laser_sweep._controls_snapshot()["hits"] == 2,
+      str(laser_sweep._controls_snapshot()["hits"]))
+
+# 缓存过期 → 必须重新 OCR
+laser_sweep._controls_snapshot()["stamp"] = time.monotonic() - 9999
+stale = reco.analyze(ctx, _FakeArgv({**base_param, "return_box": "input"}, image))
+check("缓存过期后重新 OCR", ctx.calls == 2, f"调用 {ctx.calls} 次")
+check("重新定位的结果依旧正确", tuple(stale.box) == expected_input, str(stale.box))
+
+# 窗口尺寸变了 → 老坐标立刻作废
+bigger = _FakeImage(width=1920, height=1080)
+reco.analyze(ctx, _FakeArgv({**base_param, "return_box": "input"}, bigger))
+check("截图尺寸变了就重新 OCR", ctx.calls == 3, f"调用 {ctx.calls} 次")
+
+# use_cache=false → 退回老行为，每次都 OCR
+no_cache = {**base_param, "return_box": "input", "use_cache": False}
+ctx2 = _FakeContext(screen_hits)
+reco.analyze(ctx2, _FakeArgv(no_cache, image))
+reco.analyze(ctx2, _FakeArgv(no_cache, image))
+check("use_cache=false 时每次都 OCR（老行为还在）", ctx2.calls == 2, f"调用 {ctx2.calls} 次")
+
+# relocate_every：长跑防跑偏，每 N 次复用强制重认一次
+relocate = {**base_param, "return_box": "input", "relocate_every": 2}
+laser_sweep._forget_controls()  # 从干净状态开始数，免得吃到上一段的缓存
+ctx3 = _FakeContext(screen_hits)
+reco.analyze(ctx3, _FakeArgv(relocate, image))  # 第 1 次：OCR 建缓存（hits=0）
+reco.analyze(ctx3, _FakeArgv(relocate, image))  # 复用 1
+reco.analyze(ctx3, _FakeArgv(relocate, image))  # 复用 2 → 达到上限
+reco.analyze(ctx3, _FakeArgv(relocate, image))  # 强制重认
+check("relocate_every=2 时每 2 次复用重认一遍", ctx3.calls == 2, f"调用 {ctx3.calls} 次")
+
+# 缓存失效后重新定位：先用「上次位置外扩」的小 ROI 试，认到了就不必全屏
+laser_sweep._forget_controls()
+laser_sweep._remember_controls((497, 293, 95, 16), (726, 292, 61, 20), expected_input, (1331, 720))
+laser_sweep._controls_snapshot()["stamp"] = time.monotonic() - 9999  # 只让它过期，坐标还准
+hint_roi = laser_sweep._pad_roi(
+    list(laser_sweep._controls_snapshot()["boxes"].values()), laser_sweep.DEFAULT_HINT_ROI_PAD, (1331, 720)
+)
+check("提示 ROI 把三个框都圈住了并裁进屏幕",
+      hint_roi[0] >= 0 and hint_roi[1] >= 0 and hint_roi[0] + hint_roi[2] <= 1331
+      and hint_roi[1] + hint_roi[3] <= 720 and hint_roi[2] < 1331 and hint_roi[3] < 720,
+      f"roi={hint_roi}")
+check("提示 ROI 比全屏小得多（这才是它省时间的原因）",
+      hint_roi[2] * hint_roi[3] < 1331 * 720 * 0.5, f"{hint_roi[2]}x{hint_roi[3]}")
+
+# 参数解析：字符串/布尔混着写也不能翻车
+check("_flag 认 'false'/'0'/'off'", not laser_sweep._flag("false") and not laser_sweep._flag("0")
+      and not laser_sweep._flag("off") and laser_sweep._flag("true") and laser_sweep._flag(None))
+check("_number 认不出来就退回默认值",
+      laser_sweep._number("abc", 7.0) == 7.0 and laser_sweep._number("1.5", 7.0) == 1.5
+      and laser_sweep._number(None, 7.0) == 7.0)
+
+laser_sweep._forget_controls()
 
 print()
 print("=" * 78)

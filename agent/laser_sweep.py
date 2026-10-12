@@ -7,6 +7,9 @@
     laser_sweep_apply_param  把本轮参数值注入输入框节点的 input_text
     （点击 / 全选 / 输入 / 点 Setting 由流水线节点完成，不在本文件里）
     laser_find_nearest_setting  找出离 "Temperature" 最近的 "Setting" 并交给 Click
+                             ★ 第一次会全屏 OCR，并把「标签 / 输入框 / 按钮」三个框缓存下来；
+                               之后每轮直接复用缓存（见 _remember_controls / _controls_fresh），
+                               省掉每轮两次全屏 OCR —— 实测这是整个流程里最贵的一步
     laser_read_value_b       读取 B 软件测量值
                              · 配了 window_regex → 单独建 Win32 控制器截 B 的图
                              · 没配            → 用主控制器的截图（也就是 A 的画面）
@@ -27,6 +30,7 @@ import ctypes
 import json
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -61,6 +65,17 @@ DEFAULT_TARGET_MAX_CHARS = 16  # 按钮文字同样是短文本："Setting"=7、
 DEFAULT_VALUE_MAX_CHARS = 24  # "-79.720dBm"=10、"1061 nm"=7 都在内
 DEFAULT_MIN_DIGIT_RATIO = 0.3  # 数值文本里数字字符的最低占比
 
+# ── A 软件控件定位缓存 ────────────────────────────────────────────────────
+# 为什么要有它：一轮扫描里「找 Temperature」和「找 Setting」本来是两次全屏 OCR，
+# 而这两次认的其实是**同一屏、同一行**的三个框（标签 / 输入框 / 按钮）。
+# 2026-10-12 复核 09-22 的运行日志：一次全屏 OCR 中位 4.57 秒（38 次采样的中位数），
+# 也就是说光定位每轮就烧掉约 9 秒 —— 而整个扫描期间窗口根本不会动。
+# 于是改成：第一次 OCR 把三个框一起存下来，之后每轮直接复用，
+# 只在「缓存过期 / 截图尺寸变了 / 显式关掉缓存」时才重新 OCR。
+DEFAULT_CACHE_TTL = 600.0  # 缓存最长用多久（秒）；0 = 不因时间失效
+DEFAULT_HINT_ROI_PAD = 240  # 缓存失效后重定位：拿上次的框外扩这么多像素当 ROI 先试一次
+DEFAULT_RELOCATE_EVERY = 0  # 每复用多少次强制重新 OCR 一次；0 = 不强制
+
 # 跨节点共享的运行状态；每次 laser_sweep_begin 都会整体重置
 _state: dict[str, Any] = {
     "values": [],  # ["20", "21", ..., "30"]
@@ -68,6 +83,7 @@ _state: dict[str, Any] = {
     "csv_path": None,  # 绝对路径 Path
     "measured": None,  # 本轮读到的测量值（float），None 表示没读到
     "image_size": None,  # 最近一次识别用的截图尺寸 (w, h)，用于按比例算偏移
+    "controls": None,  # A 软件控件定位缓存 {boxes, size, stamp, hits}，见 _remember_controls
 }
 
 # 给 B 软件找到的窗口缓存：{window_regex: (hwnd, 标题, 类名)}
@@ -187,6 +203,153 @@ def _apply_wait_seconds(context: Context, param: dict[str, Any]) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- #
+# A 软件控件定位缓存
+#
+# 一轮扫描里的两次全屏 OCR（找 Temperature、找 Setting）认的是同一屏、同一行的
+# 三个框，纯属重复劳动。这里把它们缓存起来，让第二次以及后续每一轮都直接复用：
+#
+#     _remember_controls()  OCR 成功后把三个框一起存下来
+#     _controls_fresh()     判断缓存还能不能直接用（开关 / 尺寸 / 时长 / 强制重定位）
+#     _pad_roi()            缓存失效后重定位时，用上次的框外扩一圈当 ROI 先试一次
+#
+# 读参数的约定（都写在节点的 custom_recognition_param 里）：
+#     use_cache        true（默认）/ false   关掉缓存，退回「每次都 OCR」的老行为
+#     cache_ttl        秒，默认 600          缓存最长用多久；0 = 不因时间失效
+#     relocate_every   次数，默认 0          每复用多少次强制重新 OCR 一次；0 = 不强制
+#     hint_roi_pad     像素，默认 240        重新定位时先用「上次位置外扩」这个小 ROI 试；
+#                                            0 = 关掉，直接全屏
+# 安全兜底：截图尺寸一变（窗口被挪/被缩放）缓存立刻作废，不会拿着旧坐标去点。
+# --------------------------------------------------------------------------- #
+def _flag(value: Any, default: bool = True) -> bool:
+    """把流水线传来的开关解析成 bool，字符串 "false"/"0"/"off" 都当关。"""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(value)
+
+
+def _number(value: Any, default: float) -> float:
+    """把流水线传来的数字解析成 float，认不出来就用默认值。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _controls_snapshot() -> Optional[dict[str, Any]]:
+    """取出缓存字典本身（可能已过期），没有就返回 None。"""
+    cached = _state.get("controls")
+    return cached if isinstance(cached, dict) else None
+
+
+def _controls_fresh(param: dict[str, Any], size: Optional[tuple[int, int]]) -> Optional[dict[str, Any]]:
+    """缓存能不能直接用？能用就返回缓存（并累加复用次数），否则返回 None。
+
+    四种作废条件各打印一行原因，真机上对着日志就能知道它为什么又去 OCR 了。
+    """
+    cached = _controls_snapshot()
+    if cached is None:
+        return None
+
+    if not _flag(param.get("use_cache"), True):
+        print("[laser_sweep]   ♻️ use_cache=false，每次都重新 OCR 定位")
+        return None
+
+    cached_size = cached.get("size")
+    if size and cached_size and tuple(cached_size) != tuple(size):
+        print(
+            f"[laser_sweep]   截图尺寸变了（缓存 {tuple(cached_size)} → 现在 {tuple(size)}），"
+            "定位缓存作废，重新 OCR"
+        )
+        return None
+
+    ttl = _number(param.get("cache_ttl"), DEFAULT_CACHE_TTL)
+    age = time.monotonic() - float(cached.get("stamp") or 0.0)
+    if ttl > 0 and age > ttl:
+        print(f"[laser_sweep]   定位缓存已过期（{age:.0f} 秒 > {ttl:.0f} 秒），重新 OCR")
+        return None
+
+    limit = int(_number(param.get("relocate_every"), DEFAULT_RELOCATE_EVERY))
+    if limit > 0 and int(cached.get("hits") or 0) >= limit:
+        print(f"[laser_sweep]   按 relocate_every={limit} 强制重新 OCR 一次（防止长跑慢慢跑偏）")
+        cached["hits"] = 0
+        return None
+
+    cached["hits"] = int(cached.get("hits") or 0) + 1
+    cached["age"] = age
+    return cached
+
+
+def _forget_controls(reason: str = "") -> None:
+    """丢掉缓存（定位失败时用，免得下次还拿旧坐标硬试）。"""
+    if _state.get("controls") is None:
+        return
+    _state["controls"] = None
+    print(f"[laser_sweep]   定位缓存已清空" + (f"：{reason}" if reason else ""))
+
+
+def _remember_controls(
+    anchor_box: Any,
+    target_box: Any,
+    input_box: Any,
+    size: Optional[tuple[int, int]],
+) -> None:
+    """把这一屏 OCR 出来的三个框一起存下来，供后续每一轮复用。
+
+    三个框对应节点的 return_box：
+        anchor → 参数标签（"Temperature:"）
+        target → Setting 按钮
+        input  → 标签与按钮之间那个输入框
+    """
+    boxes: dict[str, list[int]] = {}
+    for key, box in (("anchor", anchor_box), ("target", target_box), ("input", input_box)):
+        if box is None or len(tuple(box)) != 4:
+            continue
+        x, y, w, h = (int(v) for v in box)
+        if w > 0 and h > 0:
+            boxes[key] = [x, y, w, h]
+    if not boxes:
+        return
+
+    _state["controls"] = {
+        "boxes": boxes,
+        "size": tuple(size) if size else None,
+        "stamp": time.monotonic(),
+        "hits": 0,
+    }
+    print(
+        "[laser_sweep]   📌 已缓存 A 软件控件位置："
+        + "；".join(f"{key}={box}" for key, box in boxes.items())
+    )
+
+
+def _pad_roi(
+    boxes: list[list[int]],
+    pad: int,
+    size: Optional[tuple[int, int]],
+) -> list[int]:
+    """把若干框合并成「一个外扩 pad 像素」的 ROI，并裁到图像范围内。
+
+    用于缓存失效后的重新定位：窗口没动的话，控件还在老位置附近，
+    认这一小块比认整屏快得多（实测全屏 OCR 中位 4.57 秒，小 ROI 只要零点几秒）。
+    """
+    xs = [int(b[0]) for b in boxes]
+    ys = [int(b[1]) for b in boxes]
+    x1s = [int(b[0]) + int(b[2]) for b in boxes]
+    y1s = [int(b[1]) + int(b[3]) for b in boxes]
+
+    x0, y0 = min(xs) - pad, min(ys) - pad
+    x1, y1 = max(x1s) + pad, max(y1s) + pad
+    if size:
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(int(size[0]), x1), min(int(size[1]), y1)
+    return [x0, y0, max(0, x1 - x0), max(0, y1 - y0)]
+
+
 def _build_values(start: float, end: float, step: float) -> list[str]:
     """按 start / end / step 生成参数序列，用整数计数避免浮点累加误差。"""
     count = int(round((end - start) / step)) + 1
@@ -199,15 +362,23 @@ def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
     return (x + w / 2.0, y + h / 2.0)
 
 
+def _image_size_of(image: Any) -> Optional[tuple[int, int]]:
+    """从截图里读出 (宽, 高)，读不到就 None —— 定位缓存的尺寸校验要用它。"""
+    shape = getattr(image, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[1]), int(shape[0])
+    return None
+
+
 def _remember_image_size(image: Any) -> None:
     """记下当前截图的尺寸，供「按比例算偏移」使用。
 
     直接取识别回调收到的 argv.image 是最省事的——它一定存在，
     不用去依赖 controller.cached_image 之类的接口。
     """
-    shape = getattr(image, "shape", None)
-    if shape is not None and len(shape) >= 2:
-        _state["image_size"] = (int(shape[1]), int(shape[0]))
+    size = _image_size_of(image)
+    if size is not None:
+        _state["image_size"] = size
 
 
 def _distance_sq(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -931,10 +1102,14 @@ class LaserSweepBegin(CustomAction):
         if not _apply_wait_seconds(context, param):
             return False
 
-        _state.update(values=values, index=0, csv_path=csv_path, measured=None)
+        _state.update(values=values, index=0, csv_path=csv_path, measured=None, controls=None)
 
         print(f"[laser_sweep] 参数序列共 {len(values)} 组：{values[0]} → {values[-1]}（步长 {_fmt(step)}）")
         print(f"[laser_sweep] 结果文件：{csv_path}")
+        print(
+            "[laser_sweep] 定位缓存：本轮开始先全屏 OCR 一次，之后每轮复用"
+            "（想关掉就在节点参数里写 use_cache=false）"
+        )
         return True
 
 
@@ -1059,12 +1234,14 @@ class LaserFindNearestSetting(CustomRecognition):
         # 标签一定是短文本；界面上那些 Tips / 日志行长得很像标签，必须挡掉
         anchor_max_chars = int(param.get("anchor_max_chars", DEFAULT_ANCHOR_MAX_CHARS))
         # "target"（默认）返回离锚点最近的按钮；"anchor" 返回那个锚点本身；
-        # "input" 返回「标签与按钮之间」那个输入框的位置（每次执行都重新 OCR 定位，
-        # 不依赖任何写死的比例，换电脑/换分辨率都能自己跟上）。
+        # "input" 返回「标签与按钮之间」那个输入框的位置。
+        # 三者都由第一次全屏 OCR 现场折算（不依赖任何写死的比例，换电脑/换分辨率都能跟上），
+        # 之后每轮直接吃缓存 —— 想强制每次都重认，就写 use_cache=false。
         return_box = str(param.get("return_box") or "target").lower()
 
         # 记下当前截图的尺寸，仅作日志/兜底用；定位本身已经不依赖它了
         _remember_image_size(argv.image)
+        size = _image_size_of(argv.image) or _state.get("image_size")
 
         # 把这次真正生效的定位配置打出来：万一流水线没换成新版，
         # 日志里一眼就能看出来（near_text 缺失 = pipeline 还是旧的）
@@ -1073,12 +1250,66 @@ class LaserFindNearestSetting(CustomRecognition):
             f"return_box={return_box} near_text={near_texts!r} anchor_max_chars={anchor_max_chars}"
         )
 
-        # 这两个词都要做「检测 + 识别」，所以 only_rec 必须是 False
-        raw = _ocr_hits(context, argv.image, ocr_node, [], roi, only_rec=False)
+        # ── ★ 缓存优先 ────────────────────────────────────────────────────
+        # 同一轮扫描期间窗口不会动：第一次全屏 OCR 已经把「标签 / 输入框 / 按钮」
+        # 三个框都夹出来了，那么第二次（点 Setting）以及后面每一轮，
+        # 没有任何理由再把同一屏认一遍 —— 而全屏 OCR 正是整个流程里最贵的一步。
+        cached = _controls_fresh(param, size)
+        if cached is not None:
+            boxes = cached.get("boxes") or {}
+            reused = boxes.get(return_box) or boxes.get("input")
+            if reused:
+                print(
+                    f"[laser_sweep]   ♻️ 复用定位缓存（return_box={return_box}）{reused}"
+                    f"；已复用 {cached.get('hits')} 次，缓存 {cached.get('age', 0):.0f} 秒"
+                )
+                return CustomRecognition.AnalyzeResult(
+                    box=tuple(reused),
+                    detail={
+                        "cached": True,
+                        "returned": return_box,
+                        "boxes": boxes,
+                        "reuse_count": cached.get("hits"),
+                    },
+                )
+            print(f"[laser_sweep]   缓存里没有 return_box={return_box} 这个框，重新 OCR 定位")
+
+        # ── OCR 定位 ──────────────────────────────────────────────────────
+        # 正常情况下一整轮扫描只会走到这里一次（第一轮）。
+        # 缓存过期 / 窗口尺寸变化后重新定位时，先用「上次位置外扩一圈」的小 ROI 试一把：
+        # 窗口没动的话控件还在老位置附近，认一小块比认整屏快得多。
+        tries: list[Any] = []
+        hint_pad = int(_number(param.get("hint_roi_pad"), DEFAULT_HINT_ROI_PAD))
+        stale = _controls_snapshot() or {}
+        stale_boxes = [b for b in (stale.get("boxes") or {}).values()]
+        stale_size = stale.get("size")
+        hint_ok = (
+            hint_pad > 0
+            and stale_boxes
+            and size is not None
+            and stale_size is not None
+            and tuple(stale_size) == tuple(size)  # 尺寸变了老坐标就没意义了
+        )
+        if hint_ok:
+            hint = _pad_roi(stale_boxes, hint_pad, size)
+            if hint[2] > 0 and hint[3] > 0:
+                tries.append(hint)
+        tries.append(roi)
+
+        raw: list[tuple[tuple[int, int, int, int], str]] = []
+        for attempt, try_roi in enumerate(tries):
+            if attempt:
+                print(f"[laser_sweep]   小 ROI 没认到东西，退回 roi={roi} 再认一次")
+            raw = _ocr_hits(context, argv.image, ocr_node, [], try_roi, only_rec=False)
+            if raw:
+                if attempt:
+                    print(f"[laser_sweep]   ✓ 小 ROI {tries[0]} 里认到了，省下一次全屏 OCR")
+                break
         if not raw:
+            _forget_controls("重新定位时这一屏什么都没 OCR 到")
             return CustomRecognition.AnalyzeResult(
                 box=None,
-                detail={"error": "这一屏没有 OCR 到任何文字"},
+                detail={"error": "这一屏没有 OCR 到任何文字", "tried_rois": tries},
             )
 
         anchors = _short_hits(_match_text(raw, anchor_texts), anchor_max_chars, "锚点")
@@ -1174,10 +1405,12 @@ class LaserFindNearestSetting(CustomRecognition):
         dist, anchor_box, anchor_text_used, best_box, best_text = best
         print(f"[laser_sweep]   选中：锚点 {anchor_text_used!r} @ {anchor_box} → 按钮 {best_text!r} @ {best_box}")
 
+        # 输入框每次都由**这一屏**的「标签框 + 按钮框」现场夹出来（不写死比例），
+        # 顺带把三个框一起存进缓存：后面每一轮 return_box=input 就不必再 OCR 了。
+        input_box = _input_box_between(anchor_box, best_box, raw)
+
         if return_box == "input":
-            # ★ 在这里现场折算输入框位置：用的是**这一屏**刚 OCR 出来的标签框与按钮框，
-            #   所以窗口尺寸/DPI 怎么变都不用改配置。
-            chosen_box = _input_box_between(anchor_box, best_box, raw)
+            chosen_box = input_box
             returned = "input"
         elif return_box == "anchor":
             chosen_box = anchor_box
@@ -1187,6 +1420,8 @@ class LaserFindNearestSetting(CustomRecognition):
             chosen_box = best_box
             returned = "target"
 
+        _remember_controls(anchor_box, best_box, input_box, size)
+
         return CustomRecognition.AnalyzeResult(
             box=chosen_box,
             detail={
@@ -1195,10 +1430,11 @@ class LaserFindNearestSetting(CustomRecognition):
                 "chosen": best_text,
                 "chosen_box": list(best_box),
                 "returned": returned,
-                "input_box": list(chosen_box) if returned == "input" else None,
+                "input_box": list(input_box),
                 "distance_sq": round(dist, 1),
                 "anchor_count": len(anchors),
                 "candidate_boxes": [list(b) for b, _ in candidates],
+                "cached": False,
             },
         )
 
