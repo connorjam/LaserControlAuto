@@ -350,10 +350,75 @@ def _pad_roi(
     return [x0, y0, max(0, x1 - x0), max(0, y1 - y0)]
 
 
-def _build_values(start: float, end: float, step: float) -> list[str]:
-    """按 start / end / step 生成参数序列，用整数计数避免浮点累加误差。"""
-    count = int(round((end - start) / step)) + 1
-    return [_fmt(start + i * step) for i in range(max(count, 0))]
+def _build_values(
+    start: float,
+    end: float,
+    step: float,
+    count: Optional[int] = None,
+) -> list[str]:
+    """生成参数序列，两种模式（用整数计数，避免浮点累加误差）：
+
+      · 按步长（默认，count 为空或 <= 0）：20, 21, ... 30
+            n = round((end - start) / step) + 1
+      · 按总点数（count > 0，**优先于步长**）：
+            步长由「区间 ÷ (count - 1)」反算，第 i 个点 = start + i × 步长，
+            用 i × 步长 而不是逐个累加，误差不会滚雪球。
+
+    总点数模式的约定（2026-10-14 按主人要求定下）：
+
+      ① count == 1：整个扫描只有起始值那一个点（不是非法输入，别报错）。
+      ② 区间除不尽（如 20→30 取 4 个点，间隔 10/3）时，**步长按反算值严格用**，
+         不做任何"凑整"美化；点数照样走满，最后一个点落在结束值上：
+             20 / 23.333333 / 26.666667 / 30
+         想要每个点都是"整齐"的数，就把 区间 ÷ (点数-1) 凑成整数
+         （例如 20→30 想每步 2，就填 6 个点）。
+
+    浮点坑记一笔：count 模式下用 span/(count-1) 反算步长时，
+    不能简单地把「第 count 个点」直接写成 end —— 有的区间反算后
+    那个点的位置会略微越过终点，所以这里统一「先按步长生成、再裁掉越界尾巴」，
+    并把与终点几乎重合的最后一点吸附成终点（20→30 填 4 点收尾就是干净的 30，
+    步长 0.1 也不会收在 20.999999）。自检见 tools/check_pickers.py ⑩。
+    """
+    span = end - start
+
+    if count is not None and count > 0:
+        if count == 1:
+            return [_fmt(start)]
+        step = span / (count - 1)
+
+    # ⚠️ 别用「直接算 count 个点、最后一点写死成 end」的写法：
+    #    浮点反算出来的步长会让少数区间在末端多出一个点（越过 end），
+    #    也会让本该收在终点的序列停成 20.999999 这种脏数。
+    #    统一走「按步长生成 → 裁掉越界尾巴 → 末端吸附」这三步。
+    n = int(round(span / step)) + 1
+    values = [start + i * step for i in range(max(n, 0))]
+    while len(values) > 1 and values[-1] > end:
+        values.pop()
+    if count is not None and count > 1 and values and values[-1] != end:
+        # 只在「最后那个点的位置本来就是终点」时才吸附（容差按区间取，避免误吸）
+        if abs(values[-1] - end) <= abs(span) * 1e-9:
+            values[-1] = end
+    return [_fmt(v) for v in values]
+
+
+def _resolve_count(param: dict[str, Any]) -> list[str]:
+    """读「总点数」参数：认得出正整数就当点数模式，否则当没填。
+
+    写 0（默认）/ 留空 / 写错 —— 一律退回「按步长算」的老行为，
+    这样老配置和热修复包拿到的结果完全不变。
+    """
+    raw = param.get("count")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return []
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"[laser_sweep] 「扫描点数」不是数字：{raw!r}，已按「按步长扫描」处理")
+        return []
+    if value != int(value):
+        print(f"[laser_sweep] 「扫描点数」只能填整数：{raw!r}，已按「按步长扫描」处理")
+        return []
+    return [int(value)]
 
 
 def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -1067,17 +1132,46 @@ class LaserSweepBegin(CustomAction):
         end = float(param.get("end", 30))
         step = float(param.get("step", 1))
 
-        if step <= 0:
-            print(f"[laser_sweep] step 必须为正数，当前为 {step}")
+        # 「扫描点数」：填 0（默认）就按步长扫；填 > 0 就以点数优先，步长由区间反算。
+        # 用列表取值是为了区分「没填」和「填了 0」—— 两者都退回按步长。
+        count_list = _resolve_count(param)
+        count = count_list[0] if count_list else None
+
+        if count is None:
+            if step <= 0:
+                print(f"[laser_sweep] step 必须为正数，当前为 {step}")
+                return False
+        elif count < 0:
+            print(f"[laser_sweep] 扫描点数不能为负：{count}（填 0 = 按步长扫描）")
             return False
         if end < start:
             print(f"[laser_sweep] 区间不合法：start={_fmt(start)} > end={_fmt(end)}")
             return False
 
-        values = _build_values(start, end, step)
+        values = _build_values(start, end, step, count)
         if not values:
             print("[laser_sweep] 参数序列为空")
             return False
+
+        # 点数模式下真正的步长是反算出来的（可能与界面上填的步长输入框无关），
+        # 所以单独算一份，只用于打印，免得日志里的「步长」骗人。
+        if count and count > 1:
+            effective_step = (end - start) / (count - 1)
+            mode = f"按点数（{count} 个点，反算步长 {_fmt(effective_step)}）"
+        elif count == 1:
+            effective_step = step
+            mode = "按点数（1 个点，只扫起始值）"
+        else:
+            effective_step = step
+            mode = f"按步长（{_fmt(step)}）"
+
+        # ⚠️ 只在「真的填了点数」时才比这个数。count=0 是「按步长」的开关，
+        #    它和实际组数天然对不上，以前会打出一句「填的是 0 个点」的假告警。
+        if count and len(values) != count:
+            print(
+                f"[laser_sweep] 注意：填的是 {count} 个点，按步长 {_fmt(effective_step)} "
+                f"严格跑下来只有 {len(values)} 个（再下一个点会越过结束值 {_fmt(end)}，故不再生成）"
+            )
 
         csv_path = _resolve_csv_path(param)
         header = param.get("csv_header") or DEFAULT_HEADER
@@ -1104,7 +1198,11 @@ class LaserSweepBegin(CustomAction):
 
         _state.update(values=values, index=0, csv_path=csv_path, measured=None, controls=None)
 
-        print(f"[laser_sweep] 参数序列共 {len(values)} 组：{values[0]} → {values[-1]}（步长 {_fmt(step)}）")
+        print(
+            f"[laser_sweep] 参数序列共 {len(values)} 组：{values[0]} → {values[-1]}（"
+            + mode
+            + "）"
+        )
         print(f"[laser_sweep] 结果文件：{csv_path}")
         print(
             "[laser_sweep] 定位缓存：本轮开始先全屏 OCR 一次，之后每轮复用"

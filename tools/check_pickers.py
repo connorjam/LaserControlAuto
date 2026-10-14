@@ -415,6 +415,75 @@ laser_sweep._forget_controls()
 
 print()
 print("=" * 78)
+print("⑩ 扫描点数：填 0 走步长，填 >0 以点数优先（2026-10-14 新增）")
+print("=" * 78)
+
+
+def values_of(**param):
+    """照 laser_sweep_begin 的算法走一遍：解析 count → 生成序列。"""
+    count_list = laser_sweep._resolve_count(param)
+    count = count_list[0] if count_list else None
+    return laser_sweep._build_values(
+        float(param["start"]), float(param["end"]), float(param.get("step", 1)), count
+    )
+
+
+# ── 老行为必须一字不差（老配置 / 热修复包不能受影响） ──────────────────────
+check("不传 count：20→30 步长 1 仍是 11 组",
+      values_of(start=20, end=30, step=1) == [str(v) for v in range(20, 31)],
+      str(values_of(start=20, end=30, step=1)))
+check("count=0：与不传完全一致（退回按步长）",
+      values_of(start=20, end=30, step=1, count=0) == values_of(start=20, end=30, step=1))
+check("count 写空串 / 认不出的值：也退回按步长",
+      values_of(start=20, end=30, step=1, count="") == values_of(start=20, end=30, step=1)
+      and values_of(start=20, end=30, step=1, count="abc") == values_of(start=20, end=30, step=1))
+check("步长 0.5 的小数序列没被破坏",
+      values_of(start=20, end=21, step=0.5) == ["20", "20.5", "21"],
+      str(values_of(start=20, end=21, step=0.5)))
+
+# ── 点数模式 ────────────────────────────────────────────────────────────────
+check("20→30 填 11 个点 = 步长 1（11 组）",
+      values_of(start=20, end=30, step=1, count=11) == [str(v) for v in range(20, 31)],
+      str(values_of(start=20, end=30, step=1, count=11)))
+check("20→30 填 6 个点 = 步长 2",
+      values_of(start=20, end=30, step=1, count=6) == ["20", "22", "24", "26", "28", "30"],
+      str(values_of(start=20, end=30, step=1, count=6)))
+check("点数优先：步长填 1 也拦不住（count=3 → 20,25,30）",
+      values_of(start=20, end=30, step=1, count=3) == ["20", "25", "30"],
+      str(values_of(start=20, end=30, step=1, count=3)))
+check("count=1 = 只扫起始值那一个点（不是报错）",
+      values_of(start=20, end=30, step=1, count=1) == ["20"])
+check("count=2 = 起点和终点",
+      values_of(start=20, end=30, step=1, count=2) == ["20", "30"])
+
+# ── 除不尽：步长反算后照样把点数走满，终点吸附回结束值 ────────────────────
+odd = values_of(start=20, end=30, step=1, count=4)  # 反算步长 10/3 ≈ 3.3333
+check("除不尽时仍走满 4 个点", len(odd) == 4, str(odd))
+check("数值正确：20 / 23.333333 / 26.666667 / 30",
+      odd == ["20", "23.333333", "26.666667", "30"], str(odd))
+check("最后一个点是干净的 30，不是 29.999999",
+      odd[-1] == "30", odd[-1])
+check("最后一个点没有越过结束值",
+      all(float(v) <= 30 for v in odd), str(odd))
+
+# 全长序列的收尾也要干净：步长 0.1 在二进制里除不尽，别收在 20.999999
+tenth = values_of(start=20, end=21, step=0.1)
+check("步长 0.1 收尾在干净的 21（不是 20.999999）",
+      tenth[-1] == "21" and len(tenth) == 11, f"{tenth[-1]}，共 {len(tenth)} 个")
+
+# ── 边界 ───────────────────────────────────────────────────────────────────
+check("负区间 + 点数：-10→0 填 3 个点",
+      values_of(start=-10, end=0, step=1, count=3) == ["-10", "-5", "0"],
+      str(values_of(start=-10, end=0, step=1, count=3)))
+check("负点数被拒绝（_resolve_count 返回负值，由 begin 拦下）",
+      laser_sweep._resolve_count({"count": -3}) == [-3])
+check("非整数点数：退回按步长而不是乱算",
+      laser_sweep._resolve_count({"count": "2.5"}) == [])
+check("字符串形式的正整数照样认",
+      laser_sweep._resolve_count({"count": "11"}) == [11])
+
+print()
+print("=" * 78)
 print(f"结果：{'全部通过 🎉' if failures == 0 else f'{failures} 项失败'}")
 print("=" * 78)
 sys.exit(1 if failures else 0)
