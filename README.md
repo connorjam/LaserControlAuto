@@ -257,21 +257,38 @@
 - **CI 自动打包**：打一个 `v1.0.5` 标签推上去，
   GitHub Actions 会自动打包 **Windows x64 版**并创建 Release
 
-> 只是修了 agent / 流水线的一两个文件时，不必重发整个包 —— 用**热修复包**更快
+> 只是修了 agent / 流水线 / 界面配置时，不必重发整个包 —— 用**热修复包**更快
 > （几十 KB，使用者解压覆盖即可）：
 >
 > ```bash
 > python tools/pack_hotfix.py v1.0.6
 > ```
 >
-> 产物 `dist/LaserControlAuto-v1.0.6-hotfix-files.zip` 里就是
-> `agent/laser_sweep.py` 和 `resource/pipeline/my_task.json`，解压后覆盖到
-> `MFAAvalonia.exe` 那一层。脚本会打印每个文件的字节数与 md5，使用者对着
-> 运行日志里那行 `[laser_sweep] agent 文件：…（字节数，改于 …）` 就能确认换成功没有。
+> 产物 `dist/LaserControlAuto-v1.0.6-hotfix-files.zip` 里是这三样：
+>
+> | 文件 | 管什么 |
+> | --- | --- |
+> | `agent/laser_sweep.py` | 逻辑：定位、读数、扫参序列 |
+> | `resource/pipeline/my_task.json` | 流程：节点、延时、默认参数 |
+> | `interface.json` | **界面：UI 输入项 + `pipeline_override`** |
+>
+> 解压后覆盖到 `MFAAvalonia.exe` 那一层。脚本会打印每个文件的字节数与 md5，
+> 使用者对着运行日志里那行 `[laser_sweep] agent 文件：…（字节数，改于 …）`
+> 就能确认换成功没有。
+>
+> ⚠️ **`interface.json` 别漏**（2026-10-14 踩过）：
+> UI 上的「扫描设置」输入框全都定义在 `interface.json` 的 `option.*.inputs` 里，
+> agent 和 pipeline 只是**接收方**。只覆盖前两个的话，新增的输入项
+> （比如「扫描点数」）在别的电脑上**根本不会出现**——而本机因为 `install/`
+> 早被 `install.py` 重写过，看着却是好好的，很容易误判成"热修复没生效"。
+> 一句话：**动了 UI 输入项或 `pipeline_override`，就必须连 `interface.json` 一起发。**
+> （`tools/pack_hotfix.py` 的 `DEFAULT_FILES` 现在已默认包含它。）
 >
 > 打包源是 `install/` 里的副本（跟 `pack_zip.py` 一致）。由于 `install/` 是
 > `tools/install.py` 从 `agent/`、`assets/resource/` 拷过去的，脚本会先比一遍：
 > 两边不一致就停下并告诉你怎么处理（`--sync` 让它就地同步，`--force` 按现状强打）。
+> `interface.json` 不参与这项比对 —— 它本来就该和 `assets/interface.json` 不同
+> （版本号、agent 路径、welcome 都被 `install.py` 改写过了）。
 
 ---
 

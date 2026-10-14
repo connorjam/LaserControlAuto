@@ -8,9 +8,21 @@
     dist/LaserControlAuto-<version>-hotfix-files.zip
       agent/laser_sweep.py
       resource/pipeline/my_task.json
+      interface.json
 
 zip 里**不带 install/ 前缀**（跟整包一样）—— 用户解压出来直接覆盖到
 `MFAAvalonia.exe` 那一层，重启任务即可生效。
+
+⚠️ 为什么 `interface.json` 必须在里面（2026-10-14 踩的坑）：
+    UI 上的「扫描设置」那些输入框（起始值 / 步长 / **扫描点数** / …）全都定义在
+    `interface.json` 的 `option.*.inputs` 里，agent 和 pipeline 只是**接收方**。
+    只覆盖 agent + pipeline 的话，新参数根本没有界面可以填 —— 表现就是
+    「另一台电脑的 UI 上没有这个新设置」，而在本机（install/ 已被 install.py
+    重写过）看却是好的，非常容易误判成「热修复包没生效」。
+    所以：**凡是动了 UI 输入项或 pipeline_override 的改动，必须连 interface.json 一起发。**
+
+    （它同时也是 pipeline_override 的所在地 —— 少发它，新字段就传不进流水线，
+      agent 那边只会走默认值，症状更隐蔽。）
 
 用法：
 
@@ -23,6 +35,8 @@ zip 里**不带 install/ 前缀**（跟整包一样）—— 用户解压出来�
 ⚠️ 打包源是 `install/` 里的副本（和 pack_zip.py 一致）。而 install/ 是
 `tools/install.py` 从 `agent/`、`assets/resource/` 拷过去的 —— 所以脚本会先比一遍：
 两边不一致就停下并告诉你怎么处理（默认拒绝，免得把「昨天的代码」发出去）。
+`interface.json` 不参与这项比对：它本来就该和 `assets/interface.json` 不同
+（版本号、agent 路径、welcome 都被 install.py 改写过了）。
 
 每个文件都会打印字节数与 md5。用户拿到包后，对着运行日志里那行
 `[laser_sweep] agent 文件：…（75625 字节，改于 …）` 就能确认到底换成功没有。
@@ -44,10 +58,19 @@ dist_path = working_dir / "dist"
 interface_path = install_path / "interface.json"
 
 # 默认打进热修复包的文件，路径相对 install/，也就是用户程序目录里的路径。
-# 只改这两个文件时（定位逻辑 / 流水线参数），不必重发整包。
+#
+# 这三样分别对应「一层」：
+#   agent/laser_sweep.py            逻辑层：定位、读数、扫参序列
+#   resource/pipeline/my_task.json  流程层：节点、延时、默认参数
+#   interface.json                  界面层：UI 输入项 + pipeline_override
+#
+# ⚠️ interface.json 是 2026-10-14 补进来的：此前只发前两个，导致
+#    「扫参点数」这种**新增 UI 输入项**的改动在别的电脑上看不到
+#    （输入框定义在 interface.json 里，agent 只是接收方）。
 DEFAULT_FILES = [
     "agent/laser_sweep.py",
     "resource/pipeline/my_task.json",
+    "interface.json",
 ]
 
 
