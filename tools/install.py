@@ -60,7 +60,13 @@ except ModuleNotFoundError:
     jsonc = _Jsonc()
     print("[install] 没装 json-with-comments，使用内置的 JSONC 读写")
 
-from configure import configure_ocr_model
+# configure.py 是本目录的兄弟文件，用的是「同目录裸导入」。
+# 直接 `python tools/install.py` 时，sys.path[0] 是 tools/ 本身，能导入；
+# 但用 runpy、-m、或从别处调进来时就不一定了 —— 这里显式补一下，
+# 免得出现 "No module named 'configure'"（2026-10-16 实测踩到）。
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
+from configure import configure_ocr_model  # noqa: E402
 
 
 working_dir = Path(__file__).parent.parent.resolve()

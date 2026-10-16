@@ -34,10 +34,16 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 
-from _net import download, open_url
+# _net.py 是同目录的兄弟文件。直接 `python tools/fetch_binaries.py` 时
+# sys.path[0] 就是 tools/，能导入；但用 runpy / -m 或从别处调进来时不一定。
+# 尤其是便携版 Python 带 ._pth，会覆盖 sys.path[0] —— 显式补一下最稳。
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
+from _net import download, open_url  # noqa: E402
 
 WORKING_DIR = Path(__file__).parent.parent.resolve()
 DOWNLOADS = WORKING_DIR / "deps" / "downloads"

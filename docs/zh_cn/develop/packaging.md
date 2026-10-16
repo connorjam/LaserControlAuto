@@ -210,7 +210,10 @@ zip **不带 `install/` 前缀**，用户解压出来第一层就是 `MFAAvaloni
 | `tools/prepare_embedded_python.py` | 准备便携版 Python（产物在 `deps/python/`） |
 | `tools/install.py` | 组装 `install/`：拷原生库、资源、agent、便携版 Python，并改写 `interface.json` |
 | `tools/pack_zip.py` | 把 `install/` 打成 `dist/` 里的发布 zip（自动排除运行时目录） |
+| `tools/pack_hotfix.py` | 只把 agent / 流水线 / interface.json 打成几十 KB 的热修复包 |
 | `tools/configure.py` | 检查 OCR 模型（已有则跳过） |
+| `tools/check_pickers.py` | 定位与读数逻辑自检（不连软件，改完跑一下） |
+| `tools/check_output.py` | 输出目录与文件名逻辑自检 |
 | `.github/workflows/install.yml` | CI 版的全套流程，本地打包可以对照着看 |
 
 ---
