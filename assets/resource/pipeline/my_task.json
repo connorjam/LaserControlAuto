@@ -90,12 +90,13 @@
             //   csv_dir        本次结果的子文件夹名，默认「系统时间_output」。
             //                  认 strftime（%Y%m%d 等）与 {date}/{time}/{datetime} 别名；
             //                  留空 = 用默认时间名。填绝对路径 = 直接当总目录（兼容老配置）。
-            //   csv_name       结果文件名，默认 laser_sweep_result.csv（不写 .csv 会自动补）
+            //   csv_name       结果文件名。留空 = 自动用「时间_起始值_终止值_总点数」，
+            //                  如 20261016_143435_20_30_11（不写 .csv 会自动补）
             //   output_root    总目录名，默认 output（相对 interface.json 所在目录）
             //   open_when_done 跑完是否自动打开 output 文件夹，默认 true
             // 想整个换地方，就把 output_root 填绝对路径，如 "D:\\扫描数据"。
             "csv_dir": "",
-            "csv_name": "laser_sweep_result.csv",
+            "csv_name": "",
             "output_root": "output",
             "open_when_done": true,
             "csv_header": ["序号", "设定参数", "B软件测量值", "时间"]

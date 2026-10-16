@@ -62,17 +62,18 @@ DEFAULT_PATTERN = r"[-+]?\d+(?:\.\d+)?"
 # 每个软件所在目录下固定有一个 output/ 总目录，每次扫描的结果各占一个子文件夹：
 #
 #     软件目录/
-#     └── output/                              ← 总目录（按钮打开的就是它）
-#         ├── 20261016_110530_output/          ← 本次扫描（默认名 = 系统时间_output）
-#         │   └── laser_sweep_result.csv
+#     └── output/                                        ← 总目录（按钮打开的就是它）
+#         ├── 20261016_110530_output/                    ← 本次扫描（默认名 = 系统时间_output）
+#         │   └── 20261016_110530_20_30_11.csv           ← 默认名 = 时间_起始值_终止值_总点数
 #         └── 20261016_143012_升温测试/
-#             └── laser_sweep_result.csv
+#             └── 升温测试结果.csv
 #
 # 「系统时间」用 %Y%m%d_%H%M%S 取到秒：同一天连跑多次也不会互相覆盖
 # （每次 begin 都会覆盖写 CSV 表头，重名就等于把上一次的结果抹掉）。
 OUTPUT_ROOT_NAME = "output"
 DEFAULT_RUN_DIR_FORMAT = "%Y%m%d_%H%M%S_output"
-DEFAULT_CSV_STEM = "laser_sweep_result"  # 没写扩展名时自动补 .csv
+# 用户把「结果文件名」填得只剩非法字符时的兜底名（正常情况下走 _default_csv_stem）
+DEFAULT_CSV_STEM = "laser_sweep_result"
 
 # Windows 文件名里不许出现的字符：\ / : * ? " < > |
 # 用户可能把「文件夹名」填成 "2026/10/16 测试" 或 "a:b"，
@@ -199,7 +200,7 @@ def _sanitize_name(raw: str, fallback: str = "") -> str:
 
 
 def _expand_time_format(raw: str) -> str:
-    """把文件夹名里的时间占位符换成当前时间。
+    """把名称里的时间占位符换成当前时间。
 
     支持 strftime 写法（%%Y%%m%%d 等），也认几个顺手的中文别名，
     免得用户为了加个日期还要去查 strftime 表：
@@ -225,11 +226,44 @@ def _expand_time_format(raw: str) -> str:
         text = now.strftime(text)
     except ValueError:
         # 用户写了 %Q 这种非法格式符 —— 保留原文，别让整轮扫描开不了头
-        print(f"[laser_sweep] 文件夹名里的时间格式无法解析：{raw!r}，按原样使用")
+        print(f"[laser_sweep] 名称里的时间格式无法解析：{raw!r}，按原样使用")
     return text.replace(sentinel, "%")
 
 
-def _resolve_output_paths(param: dict[str, Any]) -> tuple[Path, Path]:
+def _default_csv_stem(
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    total: Optional[int] = None,
+) -> str:
+    """默认结果文件名：时间_起始值_终止值_总点数（2026-10-16 主人要求）。
+
+    例：20→30 扫 11 个点 → 20261016_143435_20_30_11
+
+    这样做的好处是**光看文件名就知道这次扫了什么**：
+    翻 output/ 里的一堆结果时，不必逐个打开 CSV 去对照参数。
+
+    · 时间取到秒（%%Y%%m%%d_%%H%%M%%S），与文件夹名一致的做法；
+    · 「总点数」用的是**实际**组数（步长模式下由区间算出来），
+      不是用户填的那个 count —— 名字要对得上 CSV 里的真实行数；
+    · 三个参数拿不到时（比如「打开输出文件夹」只关心目录）就只留时间，
+      不会拼出一串 None。
+    """
+    bits = [datetime.now().strftime("%Y%m%d_%H%M%S")]
+    if start is not None:
+        bits.append(_fmt(start))
+    if end is not None:
+        bits.append(_fmt(end))
+    if total is not None:
+        bits.append(str(int(total)))
+    return "_".join(bits)
+
+
+def _resolve_output_paths(
+    param: dict[str, Any],
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    total: Optional[int] = None,
+) -> tuple[Path, Path]:
     """算出「本次扫描的结果文件」和「output 总目录」，返回 (csv_path, out_root)。
 
     目录结构（2026-10-16 起）：
@@ -238,8 +272,12 @@ def _resolve_output_paths(param: dict[str, Any]) -> tuple[Path, Path]:
     读的参数（都来自 UI「扫描设置」）：
         csv_dir      本次结果的文件夹名，默认「系统时间_output」
                      留空 → 用默认名；填了绝对路径 → 直接当总目录用（兼容老配置）
-        csv_name     结果文件名，默认 laser_sweep_result；没写 .csv 会自动补
+        csv_name     结果文件名。留空 → 用默认名「时间_起始值_终止值_总点数」
+                     （见 _default_csv_stem）；没写 .csv 会自动补
         output_root  总目录名，默认 output（相对 interface.json 所在目录）
+
+    start / end / total 是本次扫描的区间与实际组数，只用于拼默认文件名；
+    拿不到（None）时默认名退化成「只有时间」。
 
     兼容老行为：csv_dir 以前是「结果直接落在哪个文件夹」。
     现在它的语义变成「output 下面的子文件夹名」，
@@ -260,10 +298,15 @@ def _resolve_output_paths(param: dict[str, Any]) -> tuple[Path, Path]:
             print(f"[laser_sweep] 用的是旧版 csv_path 参数：{target}")
             return target, target.parent
 
-    filename = _sanitize_name(stem, DEFAULT_CSV_STEM)
+    # 用户填了就照用户的写（同样支持 %Y%m%d / {datetime} 这类时间占位符）；
+    # 留空才用「时间_起始值_终止值_总点数」这个默认名。
+    if stem:
+        filename = _sanitize_name(_expand_time_format(stem), DEFAULT_CSV_STEM)
+    else:
+        filename = _default_csv_stem(start, end, total)
+    filename = _sanitize_name(filename, DEFAULT_CSV_STEM)
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
-    # 文件名里不该出现路径分隔符（上面 _sanitize_name 已经换成下划线了）
 
     run_name = _sanitize_name(_expand_time_format(run_dir), "")
     if not run_name:
@@ -1364,7 +1407,11 @@ class LaserSweepBegin(CustomAction):
                 f"严格跑下来只有 {len(values)} 个（再下一个点会越过结束值 {_fmt(end)}，故不再生成）"
             )
 
-        csv_path, out_root = _resolve_output_paths(param)
+        # 把区间与实际组数一并传进去：默认文件名要用它们拼成
+        # 「时间_起始值_终止值_总点数」，光看名字就知道这次扫了什么。
+        csv_path, out_root = _resolve_output_paths(
+            param, start=start, end=end, total=len(values)
+        )
         header = param.get("csv_header") or DEFAULT_HEADER
 
         try:

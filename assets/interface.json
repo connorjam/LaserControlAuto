@@ -179,8 +179,8 @@
                 {
                     "name": "结果文件名",
                     "label": "结果文件名",
-                    "description": "CSV 文件名，默认 laser_sweep_result.csv。不写 .csv 会自动补上",
-                    "default": "laser_sweep_result.csv"
+                    "description": "CSV 文件名。留空（默认）= 自动用「时间_起始值_终止值_总点数」命名，例如 20261016_143435_20_30_11，光看名字就知道扫了什么；也可以自己起名，同样支持 %Y%m%d、{date}、{time}、{datetime} 等时间占位符。不写 .csv 会自动补上",
+                    "default": ""
                 },
                 {
                     "name": "跑完自动打开",

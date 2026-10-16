@@ -171,8 +171,29 @@ with scratch("paths") as tmp:
     check("子文件夹名 = 系统时间_output，且到秒",
           re.fullmatch(r"\d{8}_\d{6}_output", csv_path.parent.name) is not None,
           csv_path.parent.name)
-    check("默认文件名 laser_sweep_result.csv", csv_path.name == "laser_sweep_result.csv",
-          csv_path.name)
+    check("不给区间时默认文件名退化成「只有时间」",
+          re.fullmatch(r"\d{8}_\d{6}", csv_path.stem) is not None, csv_path.name)
+
+    # 默认文件名：时间_起始值_终止值_总点数（2026-10-16 主人要求）
+    csv_named, _ = ls._resolve_output_paths(dict(base), start=20.0, end=30.0, total=11)
+    check("默认文件名 = 时间_起始值_终止值_总点数",
+          re.fullmatch(r"\d{8}_\d{6}_20_30_11\.csv", csv_named.name) is not None,
+          csv_named.name)
+    check("默认文件名以 .csv 结尾", csv_named.name.endswith(".csv"), csv_named.name)
+
+    # 小数区间 / 负值 / 单点也要拼得干净
+    csv_dec, _ = ls._resolve_output_paths(dict(base), start=20.5, end=21.0, total=2)
+    check("小数区间不拖泥带水（20.5 / 21）",
+          re.fullmatch(r"\d{8}_\d{6}_20\.5_21_2\.csv", csv_dec.name) is not None,
+          csv_dec.name)
+    csv_neg, _ = ls._resolve_output_paths(dict(base), start=-10.0, end=0.0, total=3)
+    check("负数区间也能拼（-10 / 0）",
+          re.fullmatch(r"\d{8}_\d{6}_-10_0_3\.csv", csv_neg.name) is not None,
+          csv_neg.name)
+    csv_one, _ = ls._resolve_output_paths(dict(base), start=20.0, end=20.0, total=1)
+    check("只扫一个点时总点数写 1",
+          re.fullmatch(r"\d{8}_\d{6}_20_20_1\.csv", csv_one.name) is not None,
+          csv_one.name)
 
     # 自定义文件夹名 + 文件名
     csv2, root2 = ls._resolve_output_paths({
@@ -181,10 +202,17 @@ with scratch("paths") as tmp:
     check("自定义文件夹名生效", csv2.parent.name == "升温测试", csv2.parent.name)
     check("自定义文件名生效", csv2.name == "结果.csv", csv2.name)
     check("自定义名也挂在 output 下", csv2.parent.parent == root2, str(csv2))
+    check("填了自定义名就不再用默认的「时间_区间_点数」",
+          "20_30_11" not in csv2.name)
 
     # 文件名不给 .csv 时自动补
     csv3, _ = ls._resolve_output_paths({**base, "csv_name": "我的结果"})
     check("文件名没写 .csv 会自动补", csv3.name == "我的结果.csv", csv3.name)
+
+    # 自定义文件名里也能写时间占位符
+    csv3b, _ = ls._resolve_output_paths({**base, "csv_name": "扫描_%Y%m%d.csv"})
+    check("自定义文件名支持时间占位符",
+          csv3b.name == "扫描_" + now.strftime("%Y%m%d") + ".csv", csv3b.name)
 
     # 文件夹名里带时间占位符
     csv4, _ = ls._resolve_output_paths({**base, "csv_dir": "{date}_升温"})
