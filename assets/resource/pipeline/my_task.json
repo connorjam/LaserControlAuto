@@ -85,12 +85,19 @@
             // 想要每步都整齐就把 区间 ÷ (点数-1) 凑成整数。
             "count": 0,
             "wait_sec": 10, // 每轮在 A 软件设好参数后等多久（秒）
-            // 结果文件夹。相对路径的基准是「interface.json 所在目录」：
-            //   开发时 → assets/output/laser_sweep_result.csv
-            //   打包后 → install/output/laser_sweep_result.csv
-            // 也可以填绝对路径，如 "D:\\数据"。
-            // 运行开始时会打印绝对路径，照着找就行。
-            "csv_dir": "./output",
+            // ── 结果输出（2026-10-16 起）──────────────────────────────────
+            // 目录结构：软件目录/output/<本次文件夹名>/<文件名>.csv
+            //   csv_dir        本次结果的子文件夹名，默认「系统时间_output」。
+            //                  认 strftime（%Y%m%d 等）与 {date}/{time}/{datetime} 别名；
+            //                  留空 = 用默认时间名。填绝对路径 = 直接当总目录（兼容老配置）。
+            //   csv_name       结果文件名，默认 laser_sweep_result.csv（不写 .csv 会自动补）
+            //   output_root    总目录名，默认 output（相对 interface.json 所在目录）
+            //   open_when_done 跑完是否自动打开 output 文件夹，默认 true
+            // 想整个换地方，就把 output_root 填绝对路径，如 "D:\\扫描数据"。
+            "csv_dir": "",
+            "csv_name": "laser_sweep_result.csv",
+            "output_root": "output",
+            "open_when_done": true,
             "csv_header": ["序号", "设定参数", "B软件测量值", "时间"]
         },
         "rate_limit": 0,
@@ -476,6 +483,30 @@
         "recognition": "DirectHit",
         "action": "Custom",
         "custom_action": "laser_sweep_finish",
+        // open_when_done：跑完自动打开 output 总目录。
+        // （界面上的开关会覆盖这里；缺字段时默认 true）
+        "custom_action_param": {
+            "open_when_done": true
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0
+    },
+
+    // ---------- ⑭ 「打开输出文件夹」—— 界面上那个独立任务的入口 ----------
+    // 与激光扫描流程完全无关：勾这个任务、点开始，就只是弹出 output 文件夹。
+    // 不依赖扫描状态（没跑过也能用，目录不存在就现建一个空的），
+    // 也不需要 A/B 软件开着 —— 但仍然要控制器连接成功，这是通用 UI 的前置条件。
+    "LaserSweepOpenOutput": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_open_output",
+        "custom_action_param": {
+            // 与 LaserSweepStart 保持同名同义（点数是给 laser_sweep_begin 用的，
+            // 这里只用到输出相关的几个字段）
+            "csv_dir": "",
+            "output_root": "output"
+        },
         "rate_limit": 0,
         "pre_delay": 0,
         "post_delay": 0

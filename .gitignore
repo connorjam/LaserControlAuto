@@ -452,8 +452,11 @@ tools/ImageCropper/**/*.png
 
 config
 debug
-# 扫描结果输出目录（见 assets/interface.json 的「输出文件夹」）
+# 扫描结果输出目录（见 assets/interface.json 的「输出总目录」）
+# 现在的结果都在 output/<系统时间>/ 里，这里忽略整个总目录
 output
+# agent 记下的「最近一次用过的 output 目录」（运行期数据，每台机器不一样）
+laser_sweep_output.json
 # 打包相关产物：MFAAvalonia 下载目录、最终压缩包
 MFA
 dist

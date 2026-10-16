@@ -58,6 +58,34 @@ DEFAULT_CSV_NAME = "laser_sweep_result.csv"
 DEFAULT_HEADER = ["序号", "设定参数", "B软件测量值", "时间"]
 DEFAULT_PATTERN = r"[-+]?\d+(?:\.\d+)?"
 
+# ── 输出目录结构（2026-10-16 主人要求）─────────────────────────────────────
+# 每个软件所在目录下固定有一个 output/ 总目录，每次扫描的结果各占一个子文件夹：
+#
+#     软件目录/
+#     └── output/                              ← 总目录（按钮打开的就是它）
+#         ├── 20261016_110530_output/          ← 本次扫描（默认名 = 系统时间_output）
+#         │   └── laser_sweep_result.csv
+#         └── 20261016_143012_升温测试/
+#             └── laser_sweep_result.csv
+#
+# 「系统时间」用 %Y%m%d_%H%M%S 取到秒：同一天连跑多次也不会互相覆盖
+# （每次 begin 都会覆盖写 CSV 表头，重名就等于把上一次的结果抹掉）。
+OUTPUT_ROOT_NAME = "output"
+DEFAULT_RUN_DIR_FORMAT = "%Y%m%d_%H%M%S_output"
+DEFAULT_CSV_STEM = "laser_sweep_result"  # 没写扩展名时自动补 .csv
+
+# Windows 文件名里不许出现的字符：\ / : * ? " < > |
+# 用户可能把「文件夹名」填成 "2026/10/16 测试" 或 "a:b"，
+# 直接拿去建目录会抛 OSError 或悄悄建出错层级，所以先换成下划线。
+_ILLEGAL_NAME_CHARS = r'\/:*?"<>|'
+_ILLEGAL_NAME_RE = re.compile(f"[{re.escape(_ILLEGAL_NAME_CHARS)}]")
+# Windows 保留设备名，做成文件夹会失败（CON/PRN/AUX/NUL/COM1-9/LPT1-9）
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 # 标签和数值都应该是「短文本」。界面上的日志/提示行动辄几十个字，
 # 它们只要含有关键词就会冒充成标签，把整条定位链带偏（见 _short_hits）。
 DEFAULT_ANCHOR_MAX_CHARS = 16  # "Temperature:"=12、"功率CH1"=6、"Wavelength"=10 都在内
@@ -81,6 +109,8 @@ _state: dict[str, Any] = {
     "values": [],  # ["20", "21", ..., "30"]
     "index": 0,  # 当前跑到第几组
     "csv_path": None,  # 绝对路径 Path
+    "out_root": None,  # output 总目录（绝对路径 Path），收尾/按钮打开它
+    "open_when_done": True,  # 跑完是否自动打开 output 文件夹
     "measured": None,  # 本轮读到的测量值（float），None 表示没读到
     "image_size": None,  # 最近一次识别用的截图尺寸 (w, h)，用于按比例算偏移
     "controls": None,  # A 软件控件定位缓存 {boxes, size, stamp, hits}，见 _remember_controls
@@ -146,31 +176,192 @@ def _resolve(path_like: str) -> Path:
     return path if path.is_absolute() else (Path.cwd() / path).resolve()
 
 
-def _resolve_csv_path(param: dict[str, Any]) -> Path:
-    """决定结果 CSV 写到哪儿。
+def _sanitize_name(raw: str, fallback: str = "") -> str:
+    """把用户填的「文件夹名 / 文件名」洗成能安全落盘的样子。
 
-    支持两种写法：
-      csv_dir  （推荐，UI 上让用户填文件夹）→ 自动拼上固定文件名
-      csv_path （旧写法，直接给完整文件路径）
+    用户可能在「文件夹名」里填日期模板、中文、空格 —— 这些都该保留；
+    但路径分隔符和 Windows 非法字符必须先换掉，否则轻则建出错层级，
+    重则直接抛 OSError 让整轮扫描开不了头。
 
-    用户可能填得很随意，所以这里一并兜底：
-      · 空字符串 / 只有空格     → 用默认文件夹 output
-      · 带引号 "D:\\x"          → 去掉引号
-      · 以 .csv 结尾            → 当成完整文件路径
-      · 绝对路径                → 原样使用
+        "2026/10/16 测试"  → "2026_10_16 测试"
+        "a:b"              → "a_b"
+        "  "               → fallback
+        "CON"              → "CON_"（Windows 保留设备名，建目录会失败）
     """
-    raw = str(param.get("csv_dir") or "").strip().strip('"').strip("'")
-    if raw:
-        candidate = Path(raw)
-        target = candidate if candidate.suffix.lower() == ".csv" else candidate / "laser_sweep_result.csv"
-        return _resolve(str(target))
+    name = _ILLEGAL_NAME_RE.sub("_", str(raw or "").strip())
+    # 结尾的点和空格 Windows 会悄悄吃掉，自己去掉免得日志里的路径和实际不符
+    name = name.rstrip(". ").strip()
+    if not name:
+        return fallback
+    if name.upper() in _RESERVED_NAMES:
+        name += "_"
+    return name
 
-    legacy = str(param.get("csv_path") or "").strip()
-    if legacy:
-        return _resolve(legacy)
 
-    # 两个都没给 → 用默认文件夹 + 固定文件名（注意要带上文件名）
-    return _resolve(str(Path(DEFAULT_CSV_DIR) / DEFAULT_CSV_NAME))
+def _expand_time_format(raw: str) -> str:
+    """把文件夹名里的时间占位符换成当前时间。
+
+    支持 strftime 写法（%%Y%%m%%d 等），也认几个顺手的中文别名，
+    免得用户为了加个日期还要去查 strftime 表：
+
+        {date}       → 20261016
+        {time}       → 110530
+        {datetime}   → 20261016_110530
+    """
+    text = str(raw or "")
+    now = datetime.now()
+    aliases = {
+        "{date}": now.strftime("%Y%m%d"),
+        "{time}": now.strftime("%H%M%S"),
+        "{datetime}": now.strftime("%Y%m%d_%H%M%S"),
+    }
+    for key, value in aliases.items():
+        text = text.replace(key, value)
+
+    # strftime：先把 %% 保护起来，免得模板里真写了百分号被当格式符
+    sentinel = "\x00PCT\x00"
+    text = text.replace("%%", sentinel)
+    try:
+        text = now.strftime(text)
+    except ValueError:
+        # 用户写了 %Q 这种非法格式符 —— 保留原文，别让整轮扫描开不了头
+        print(f"[laser_sweep] 文件夹名里的时间格式无法解析：{raw!r}，按原样使用")
+    return text.replace(sentinel, "%")
+
+
+def _resolve_output_paths(param: dict[str, Any]) -> tuple[Path, Path]:
+    """算出「本次扫描的结果文件」和「output 总目录」，返回 (csv_path, out_root)。
+
+    目录结构（2026-10-16 起）：
+        软件目录/output/<本次文件夹名>/<文件名>.csv
+
+    读的参数（都来自 UI「扫描设置」）：
+        csv_dir      本次结果的文件夹名，默认「系统时间_output」
+                     留空 → 用默认名；填了绝对路径 → 直接当总目录用（兼容老配置）
+        csv_name     结果文件名，默认 laser_sweep_result；没写 .csv 会自动补
+        output_root  总目录名，默认 output（相对 interface.json 所在目录）
+
+    兼容老行为：csv_dir 以前是「结果直接落在哪个文件夹」。
+    现在它的语义变成「output 下面的子文件夹名」，
+    但填绝对路径时仍旧当成总目录（老用户写 D:\\数据 不会突然跑到软件目录下）。
+    """
+    # ── 结果文件名 ────────────────────────────────────────────────────────
+    stem = str(param.get("csv_name") or "").strip().strip('"').strip("'")
+    # ── 本次结果的文件夹名 ────────────────────────────────────────────────
+    run_dir = str(param.get("csv_dir") or "").strip().strip('"').strip("'")
+
+    # ── 老写法 csv_path：直接给完整文件路径 ────────────────────────────────
+    # 只在「新参数一个都没填」时才认它 —— 否则用户换到新界面后，
+    # 旧的 csv_path 会把新设置悄悄顶掉。
+    if not (run_dir or stem):
+        legacy = str(param.get("csv_path") or "").strip().strip('"').strip("'")
+        if legacy:
+            target = _resolve(legacy)
+            print(f"[laser_sweep] 用的是旧版 csv_path 参数：{target}")
+            return target, target.parent
+
+    filename = _sanitize_name(stem, DEFAULT_CSV_STEM)
+    if not filename.lower().endswith(".csv"):
+        filename += ".csv"
+    # 文件名里不该出现路径分隔符（上面 _sanitize_name 已经换成下划线了）
+
+    run_name = _sanitize_name(_expand_time_format(run_dir), "")
+    if not run_name:
+        run_name = datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT)
+    # 万一用户填的模板把名字洗没了（比如全是非法字符），兜到默认时间名
+    run_name = _sanitize_name(run_name, datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT))
+
+    # ── 总目录 ────────────────────────────────────────────────────────────
+    root_raw = str(param.get("output_root") or "").strip().strip('"').strip("'")
+    root_path = Path(root_raw) if root_raw else Path(OUTPUT_ROOT_NAME)
+
+    # 用户把「本次文件夹名」填成了绝对路径 → 那是老写法的总目录，别往 output/ 里套
+    if Path(run_dir).is_absolute() or (len(run_dir) > 1 and run_dir[1] == ":"):
+        out_root = _resolve(run_dir)
+        return out_root / filename, out_root
+
+    out_root = _resolve(str(root_path))
+    return out_root / run_name / filename, out_root
+
+
+def _open_folder(path: Path) -> bool:
+    """在资源管理器里打开这个文件夹（不存在就先建出来）。
+
+    为什么不用 os.startfile：它只在 Windows 有，而且对「文件还是目录」不敏感。
+    这里统一成「先确保目录存在，再按平台选一个打开命令」，
+    顺带把失败原因打出来 —— 静默失败的话用户只会觉得"按钮没反应"。
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[laser_sweep] 创建文件夹失败：{path}（{exc}）")
+        return False
+
+    target = str(path)
+    try:
+        if sys.platform == "win32":
+            # explorer.exe 对含空格/中文的路径比 os.startfile 更稳，
+            # 而且它打开目录时不会弹"选择打开方式"。
+            import subprocess
+
+            subprocess.Popen(["explorer", target])
+        elif sys.platform == "darwin":
+            import subprocess
+
+            subprocess.Popen(["open", target])
+        else:
+            import subprocess
+
+            subprocess.Popen(["xdg-open", target])
+    except OSError as exc:
+        print(f"[laser_sweep] 打开文件夹失败：{target}（{exc}）")
+        return False
+
+    print(f"[laser_sweep] 已在资源管理器中打开：{target}")
+    return True
+
+
+def _state_file() -> Path:
+    """记录「最近一次实际使用的 output 总目录」的小文件。
+
+    为什么需要它：界面上「打开输出文件夹」是个独立任务，
+    如果用户把「输出总目录」改成了绝对路径（比如 D:\\扫描数据），
+    按钮理应打开那个目录 —— 但它不一定拿得到「扫描设置」里的值
+    （两个任务的 option 不共享，见 interface.json 的说明）。
+
+    所以每次扫描开始时把真实用到的总目录写在这里，
+    按钮优先读它；读不到（从没跑过、或换了台机器）就退回默认 output/。
+    文件故意放在软件目录下、名字带 laser_sweep_ 前缀，一眼能看出是本项目生成的。
+    """
+    return _resolve("laser_sweep_output.json")
+
+
+def _remember_output_root(root: Path) -> None:
+    try:
+        _state_file().write_text(
+            json.dumps({"output_root": str(root)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # 记不住不影响扫描本身，只是按钮可能退回默认目录
+        print(f"[laser_sweep] 提示：没能记下输出目录（{exc}），「打开输出文件夹」将使用默认 output/")
+
+
+def _recall_output_root() -> Optional[Path]:
+    path = _state_file()
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = str(data.get("output_root") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _resolve_csv_path(param: dict[str, Any]) -> Path:
+    """兼容老接口：只要结果 CSV 的路径（见 _resolve_output_paths）。"""
+    return _resolve_output_paths(param)[0]
 
 
 def _apply_wait_seconds(context: Context, param: dict[str, Any]) -> bool:
@@ -1173,7 +1364,7 @@ class LaserSweepBegin(CustomAction):
                 f"严格跑下来只有 {len(values)} 个（再下一个点会越过结束值 {_fmt(end)}，故不再生成）"
             )
 
-        csv_path = _resolve_csv_path(param)
+        csv_path, out_root = _resolve_output_paths(param)
         header = param.get("csv_header") or DEFAULT_HEADER
 
         try:
@@ -1185,6 +1376,13 @@ class LaserSweepBegin(CustomAction):
             print(f"[laser_sweep] 创建 CSV 失败: {exc}")
             print(f"[laser_sweep]   目标路径：{csv_path}")
             return False
+
+        # 记下 output 总目录，收尾时「自动打开文件夹」要用它
+        _state["out_root"] = out_root
+        # 顺手落盘一份，好让独立的「打开输出文件夹」任务也能打开同一个目录
+        _remember_output_root(out_root)
+        # 跑完是否自动打开 output 文件夹（UI 上的开关，默认开）
+        _state["open_when_done"] = _flag(param.get("open_when_done"), True)
 
         # 上一轮找到的 B 软件窗口可能已经关了，清掉重新找
         _window_cache.clear()
@@ -1204,6 +1402,7 @@ class LaserSweepBegin(CustomAction):
             + "）"
         )
         print(f"[laser_sweep] 结果文件：{csv_path}")
+        print(f"[laser_sweep] 输出目录：{out_root}（本次结果在上面的时间子文件夹里，文件名 {csv_path.name}）")
         print(
             "[laser_sweep] 定位缓存：本轮开始先全屏 OCR 一次，之后每轮复用"
             "（想关掉就在节点参数里写 use_cache=false）"
@@ -1796,7 +1995,53 @@ class LaserSweepAdvance(CustomAction):
 @AgentServer.custom_action("laser_sweep_finish")
 class LaserSweepFinish(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
-        print(f"[laser_sweep] 扫描结束，结果文件：{_state.get('csv_path')}")
+        param = _param(argv.custom_action_param)
+        csv_path = _state.get("csv_path")
+        print(f"[laser_sweep] 扫描结束，结果文件：{csv_path}")
+
+        # 跑完自动打开 output 总目录（UI 上可以关掉）。
+        # 取 _state 里存的那份，node 参数没传时也能用；默认开。
+        want = param.get("open_when_done")
+        open_it = _flag(want, True) if want is not None else bool(_state.get("open_when_done", True))
+        if open_it:
+            root = _state.get("out_root")
+            if root is None and csv_path is not None:
+                # 兜底：没记下总目录就现场推一个（csv 在 output/<本次>/ 里）
+                root = Path(csv_path).parent.parent
+                print("[laser_sweep]   没记下 output 总目录，按结果路径上推两级")
+            if root is not None:
+                _open_folder(Path(root))
+        else:
+            print("[laser_sweep] 已按设置跳过「自动打开文件夹」")
+        return True
+
+
+@AgentServer.custom_action("laser_sweep_open_output")
+class LaserSweepOpenOutput(CustomAction):
+    """随时打开 output 总目录 —— 对应界面上那个「打开输出文件夹」任务。
+
+    它不依赖扫描状态：没跑过扫描也能用（文件夹不存在就现建一个空的），
+    所以既能在扫描后看结果，也能在扫描前先确认路径对不对。
+    """
+
+    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        param = _param(argv.custom_action_param)
+
+        # 依次尝试三个来源：本次会话 → 落盘的记录 → 默认 output/
+        root = _state.get("out_root")
+        if root is not None:
+            print("[laser_sweep] 用本次扫描记下的输出目录")
+        else:
+            root = _recall_output_root()
+            if root is not None:
+                print("[laser_sweep] 用上次扫描记录下来的输出目录")
+            else:
+                root = _resolve_output_paths(param)[1]
+                print("[laser_sweep] 还没跑过扫描，打开默认输出目录")
+
+        print(f"[laser_sweep] 打开输出文件夹：{root}")
+        if not _open_folder(Path(root)):
+            return False
         return True
 
 

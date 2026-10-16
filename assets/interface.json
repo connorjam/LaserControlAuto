@@ -105,6 +105,18 @@
             "option": [
                 "扫描设置"
             ]
+        },
+        {
+            // 界面上的「打开输出文件夹」按钮：勾上它、点开始，就只是弹出 output 文件夹。
+            // （协议 V2 的 option 没有 button 类型，所以用「一个什么都不做的任务」充当按钮）
+            //
+            // 它**故意不挂任何 option**：输出位置只由「激光参数扫描」的「扫描设置」决定，
+            // 免得两个任务各存一份设置、改了一个另一个还开着旧目录。
+            // agent 会把最近一次实际用过的 output 目录记在
+            // laser_sweep_output.json 里，这个任务就打开那一个
+            // （从没跑过扫描时兜底成软件目录下的 output/）。
+            "name": "打开输出文件夹",
+            "entry": "LaserSweepOpenOutput"
         }
     ],
 
@@ -159,9 +171,28 @@
                     "pattern_msg": "请填非负整数，例如 10"
                 },
                 {
-                    "name": "输出文件夹",
-                    "label": "输出文件夹",
-                    "description": "结果 CSV 保存到哪个文件夹。可以填相对路径（如 output）或绝对路径（如 D:\\数据）。留空则用 output",
+                    "name": "结果文件夹名",
+                    "label": "结果文件夹名",
+                    "description": "本次扫描的结果放在 output 下的哪个子文件夹。留空 = 用系统时间命名（如 20261016_110530_output，同一台机器连跑多次也不会互相覆盖）。也可以自己起名，如「升温测试」，还能写时间占位符：%Y%m%d、{date}、{time}、{datetime}",
+                    "default": ""
+                },
+                {
+                    "name": "结果文件名",
+                    "label": "结果文件名",
+                    "description": "CSV 文件名，默认 laser_sweep_result.csv。不写 .csv 会自动补上",
+                    "default": "laser_sweep_result.csv"
+                },
+                {
+                    "name": "跑完自动打开",
+                    "label": "跑完自动打开文件夹",
+                    "description": "扫描结束后自动弹出 output 文件夹；不想被打扰就关掉（之后可用「打开输出文件夹」任务手动打开）",
+                    "default": "true",
+                    "pipeline_type": "bool"
+                },
+                {
+                    "name": "输出总目录",
+                    "label": "输出总目录（一般不用改）",
+                    "description": "所有扫描结果的上级目录，默认 output（就在软件所在文件夹里）。想全部存到别处就填绝对路径，如 D:\\扫描数据",
                     "default": "output"
                 }
             ],
@@ -170,6 +201,12 @@
             // ⚠️ 这里把 custom_action_param 的**全部字段**都写全了：
             //    pipeline_override 对对象是「整体替换」而不是逐字段合并，
             //    少写一个字段就会把它从原 pipeline 里抹掉。
+            //
+            // ⚠️ 输出相关的三个节点要一起覆盖：
+            //    LaserSweepStart   —— 扫描开始时算路径、建 CSV
+            //    LaserSweepDone    —— 收尾时决定要不要自动打开文件夹
+            //    LaserSweepOpenOutput —— 「打开输出文件夹」任务要打开哪个目录
+            //    三个都拿到同一份用户设置，才不会出现「按钮打开的是旧目录」。
             "pipeline_override": {
                 "LaserSweepStart": {
                     "custom_action_param": {
@@ -178,13 +215,27 @@
                         "step": "{步长}",
                         "count": "{扫描点数}",
                         "wait_sec": "{等待秒数}",
-                        "csv_dir": "{输出文件夹}",
+                        "csv_dir": "{结果文件夹名}",
+                        "csv_name": "{结果文件名}",
+                        "output_root": "{输出总目录}",
+                        "open_when_done": "{跑完自动打开}",
                         "csv_header": [
                             "序号",
                             "设定参数",
                             "B软件测量值",
                             "时间"
                         ]
+                    }
+                },
+                "LaserSweepDone": {
+                    "custom_action_param": {
+                        "open_when_done": "{跑完自动打开}"
+                    }
+                },
+                "LaserSweepOpenOutput": {
+                    "custom_action_param": {
+                        "csv_dir": "{结果文件夹名}",
+                        "output_root": "{输出总目录}"
                     }
                 }
             }

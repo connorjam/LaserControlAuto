@@ -37,7 +37,8 @@ install/
 ├── libs/MaaAgentBinary/     ← AgentServer 通信用的二进制
 ├── plugins/                 ← MaaFramework 插件
 ├── debug/                   ← 运行日志（首次运行后生成）
-├── output/                  ← 扫描结果 CSV 默认落在这里
+├── output/                  ← 扫描结果默认落在这里（每次扫描一个时间子文件夹）
+├── laser_sweep_output.json  ← agent 记的「上次用过的输出目录」，跑过才有
 ├── README.md
 └── LICENSE
 ```
