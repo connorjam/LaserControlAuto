@@ -460,3 +460,7 @@ laser_sweep_output.json
 # 打包相关产物：MFAAvalonia 下载目录、最终压缩包
 MFA
 dist
+# Mnemon 运行期记忆/文档（仅本机，不入库）
+.mnemon/
+# pip 临时目录
+.tmp_pip/
