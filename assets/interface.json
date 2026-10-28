@@ -600,7 +600,7 @@
                     "label": "通知方式",
                     "description": "三种取值（小写）：\n\n- `auto`：配了收件邮箱 + SMTP 账号就发，没配就只写日志，不会报错；\n- `email`（默认）：强制发信，配错了会在日志里写明原因（但不影响任务本身）；\n- `off`：只写日志，不发信。\n\n⚠️ 默认 `email`：本机已配好可用账号，用 `email` 能让「配错了」立刻暴露在日志里，而不是静默退化成只写日志、等你以为会收到信时才发现没收到。",
                     "default": "email",
-                    "//": "故意不放行 mail：agent 只认 email/auto/off，放行会变成校验通过但静默不生效",
+                    // 故意不放行 mail：agent 只认 email/auto/off，放行会变成校验通过但静默不生效
                     "verify": "^(auto|email|off)$",
                     "pattern_msg": "请填 auto、email 或 off（小写）"
                 },
