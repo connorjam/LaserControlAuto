@@ -188,6 +188,9 @@ def reset_state(**overrides):
         sent_alerts=0,
         # 告警路径会读这两项，必须在每个用例开头清空
         mail_param={},
+        guard_param={},
+        sample_param={},
+        scan_settings_from_task=False,
         jumps=[],
         last_note="",
     )
@@ -878,24 +881,20 @@ check("Guard 参数里没有 mail_to",
       "mail_to" not in g, str([k for k in g if k.startswith("mail")]))
 
 # --------------------------------------------------------------------------- #
-# ⑬ 告警邮件必须真的拿到「邮件设置」的配置
+# ⑬ 告警邮件必须真的拿到邮件配置
 #
 # 2026-10-27 实测事故（install/log_20261027_154637）：
 #   扫描跑完 201 组、第 176/177 两组的空值行都写了，但**一封告警信都没发出去**。
-#   日志里那句是：
-#       「缺少配置：smtp_host、smtp_user、mail_to，通知降级为 off」
-#   而卷尾的「完成通知」却发得出去 —— 因为它挂在「邮件通知」任务上，
-#   那个任务挂了「邮件设置」；而扫描任务当时只挂了「扫描设置」，
-#   Guard 节点根本拿不到 smtp_*。
+#   而卷尾的「完成通知」却发得出去 —— 原因是扫描任务没有拿到 SMTP 配置。
 #
-#   两层修复，这里各钉一条：
-#     ① interface.json：扫描任务要挂「邮件设置」，并把邮件字段注入 LaserSweepStart
-#     ② agent：begin 把邮件参数存进 _state["mail_param"]，
-#        Guard 发告警时用 _alert_mail_param 合并（而不是直接用自己的 param）
+#   2026-10-28 重构后的做法：
+#     ① 邮件信息只在「邮件通知」任务的「邮件设置」里保存一份；
+#     ② agent 在 begin 时读取这份任务设置，存进 _state["mail_param"]，
+#        Guard 发告警时用 _alert_mail_param 合并（而不是直接用自己的 param）。
 # --------------------------------------------------------------------------- #
 print()
 print("=" * 78)
-print("⑬ 告警邮件拿到的是「邮件设置」的配置（2026-10-27 修复）")
+print("⑬ 告警邮件拿到的是「邮件通知」任务的配置")
 print("=" * 78)
 
 _MAIL_SAMPLE = {
@@ -935,6 +934,192 @@ _result = ls._send_alert(
 check("真的缺配置 → 返回 ok=False 且写明缺什么",
       _result.get("ok") is False and "缺少配置" in str(_result.get("error")),
       str(_result.get("error")))
+
+# --------------------------------------------------------------------------- #
+# ⑬b 邮件设置只保存在「邮件通知」任务里，其他任务自动读取（2026-10-28）
+#
+# 2026-10-28 起主任务不再挂「邮件设置」，「邮件测试」也只剩一个按钮。
+# 这里用一份临时实例配置模拟 MFA 的保存格式，验证 agent 能正确读到
+# 「邮件通知」任务里的中文键，并映射成 smtp_* / mail_to。
+# --------------------------------------------------------------------------- #
+print()
+print("=" * 78)
+print("⑬b 邮件设置从「邮件通知」任务读取（2026-10-28）")
+print("=" * 78)
+
+_MAIL_CFG_DIR = _TMP_DIR / "_mail_task_config"
+_MAIL_CFG_DIR.mkdir(parents=True, exist_ok=True)
+if True:
+    _cfg_path = _MAIL_CFG_DIR / "default.json"
+    _cfg_path.write_text(
+        json.dumps(
+            {
+                "TaskItems": [
+                    {
+                        "name": "激光参数扫描",
+                        "option": [
+                            {"name": "扫描设置", "data": {"起始值": "20", "结束值": "30"}},
+                        ],
+                    },
+                    {
+                        "name": "邮件通知",
+                        "option": [
+                            {
+                                "name": "邮件设置",
+                                "data": {
+                                    "发送完成通知": "false",
+                                    "收件邮箱": "task@qq.com",
+                                    "SMTP账号": "sender@qq.com",
+                                    "SMTP密码": "abcd1234",
+                                    "SMTP服务器": "smtp.163.com",
+                                    "SMTP端口": "587",
+                                    "邮件主题前缀": "[TASK]",
+                                    "通知方式": "auto",
+                                    "每次最多通知": "2",
+                                },
+                            }
+                        ],
+                    },
+                    {"name": "邮件测试"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _real_mail_files = ls._mail_task_config_files
+    _saved_cache = dict(ls._MAIL_TASK_CONFIG_CACHE)
+    ls._mail_task_config_files = lambda: [_cfg_path]
+    ls._MAIL_TASK_CONFIG_CACHE.update(key=None, data={})
+    try:
+        _task_settings = ls._load_mail_settings_from_email_task()
+        check("从「邮件通知」任务读到收件人", _task_settings.get("mail_to") == "task@qq.com",
+              str(_task_settings.get("mail_to")))
+        check("从「邮件通知」任务读到 SMTP 服务器", _task_settings.get("smtp_host") == "smtp.163.com",
+              str(_task_settings.get("smtp_host")))
+        check("从「邮件通知」任务读到通知方式", _task_settings.get("notify_mode") == "auto",
+              str(_task_settings.get("notify_mode")))
+        check("「发送完成通知」也同步读到", _task_settings.get("enabled") == "false",
+              str(_task_settings.get("enabled")))
+
+        _resolved = ls._resolve_mail_param({})
+        check("空节点参数时自动用「邮件通知」任务的收件人",
+              _resolved.get("mail_to") == "task@qq.com", str(_resolved.get("mail_to")))
+        check("空节点参数时自动用「邮件通知」任务的端口",
+              _resolved.get("smtp_port") == 587, str(_resolved.get("smtp_port")))
+        check("空节点参数时自动用「邮件通知」任务的密码",
+              _resolved.get("smtp_password") == "abcd1234", "已读")
+        check("空节点参数时自动用「邮件通知」任务的模板前缀",
+              _resolved.get("mail_subject_prefix") == "[TASK]", str(_resolved.get("mail_subject_prefix")))
+
+        _override = ls._resolve_mail_param({"mail_to": "ui@qq.com", "smtp_port": "465"})
+        check("节点参数（界面/任务本身）优先于「邮件通知」任务设置",
+              _override.get("mail_to") == "ui@qq.com" and _override.get("smtp_port") == 465,
+              f"{_override.get('mail_to')} / {_override.get('smtp_port')}")
+    finally:
+        ls._mail_task_config_files = _real_mail_files
+        ls._MAIL_TASK_CONFIG_CACHE.clear()
+        ls._MAIL_TASK_CONFIG_CACHE.update(_saved_cache)
+
+# --------------------------------------------------------------------------- #
+# ⑬c 折叠分组：子 option 收起时，agent 仍能从任务配置读到设置
+#
+# checkbox 的 case 收起后，MFA 不会把子 option 的 pipeline_override
+# 合并进来；agent 的 _load_scan_settings_from_task 必须从任务配置文件兜底。
+# 这里用一份模拟的「父 checkbox + sub_options」配置验证映射和旧值保留。
+# --------------------------------------------------------------------------- #
+print()
+print("=" * 78)
+print("⑬c 折叠分组从任务配置读取扫描/校验/采样设置")
+print("=" * 78)
+
+_tree_cfg = _TMP_DIR / "_tree_scan_config.json"
+_tree_cfg.write_text(
+    json.dumps(
+        {
+            "TaskItems": [
+                {
+                    "name": "激光参数扫描",
+                    "option": [
+                        {
+                            "name": "扫描设置",
+                            "data": {"步长": "5", "起始值": "20"},
+                            "sub_options": [
+                                {
+                                    "name": "扫描设置项",
+                                    "data": {
+                                        "起始值": "25",
+                                        "结束值": "30",
+                                        "步长": "1",
+                                        "扫描点数": "0",
+                                        "等待秒数": "10",
+                                        "结果文件夹名": "",
+                                        "结果文件名": "",
+                                        "输出总目录": "output",
+                                        "跑完自动打开": "true",
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "name": "读数校验",
+                            "data": {"绝对偏差阈值": "1.0"},
+                            "sub_options": [
+                                {
+                                    "name": "读数校验项",
+                                    "data": {
+                                        "读数校验": "true",
+                                        "绝对偏差阈值": "3.0",
+                                        "相对偏差阈值": "1",
+                                        "重测等待秒数": "3",
+                                        "连续异常次数": "5",
+                                        "异常后继续测试": "true",
+                                        "读数异常发送邮件": "true",
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "name": "读数采样",
+                            "sub_options": [
+                                {
+                                    "name": "读数采样项",
+                                    "data": {"读数采样": "false", "采样时长": "0.5"},
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    ),
+    encoding="utf-8",
+)
+
+_real_scan_files = ls._mail_task_config_files
+_saved_scan_cache = dict(ls._SCAN_TASK_CONFIG_CACHE)
+ls._mail_task_config_files = lambda: [_tree_cfg]
+ls._SCAN_TASK_CONFIG_CACHE.update(key=None, data={})
+try:
+    _scan_settings = ls._load_scan_settings_from_task()
+    check("折叠分组读到新的起始值（子 option）", _scan_settings.get("start") == "25", str(_scan_settings.get("start")))
+    check("折叠分组保留老版本的自定义步长（不被新子项默认值 1 覆盖）",
+          _scan_settings.get("step") == "5", str(_scan_settings.get("step")))
+    check("折叠分组保留老版本的绝对偏差（不被新子项默认值 3.0 覆盖）",
+          _scan_settings.get("tolerance_abs") == "1.0", str(_scan_settings.get("tolerance_abs")))
+    check("折叠分组读到采样开关 false", _scan_settings.get("sample_enabled") == "false",
+          str(_scan_settings.get("sample_enabled")))
+    check("折叠分组读到采样时长 0.5", _scan_settings.get("sample_window_sec") == "0.5",
+          str(_scan_settings.get("sample_window_sec")))
+    _merged = ls._merge_scan_settings_from_task({"start": "20", "end": "30", "step": "1"})
+    check("合并后的参数以任务配置为准", _merged.get("start") == "25" and _merged.get("step") == "5",
+          f"{_merged.get('start')} / {_merged.get('step')}")
+finally:
+    ls._mail_task_config_files = _real_scan_files
+    ls._SCAN_TASK_CONFIG_CACHE.clear()
+    ls._SCAN_TASK_CONFIG_CACHE.update(_saved_scan_cache)
 
 # 正常读数路径不读盘：把读盘函数换成计数器，跑一轮看次数
 print()

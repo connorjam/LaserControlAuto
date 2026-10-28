@@ -27,6 +27,7 @@
     laser_sweep_record_failed   识别失败时写入空值占位，保证行数对齐
     laser_sweep_advance      推进到下一个参数，跑完则跳去收尾节点
     laser_sweep_finish       打印结果文件路径，收尾
+    laser_sweep_plot_curve   独立任务：把导出的 CSV 画成曲线图（实现在 plot_curve.py）
     laser_sweep_abort        定位失败时中止并打印原因
 
 依赖：pip install MaaFw
@@ -226,6 +227,74 @@ DEFAULT_TIMEOUT_SEC = 20.0  # 告警不能把终止流程卡住：超时就放�
 DEFAULT_NOTIFY_LIMIT = 1  # 一次扫描最多发几封（终止只会发生一次，这是防重入）
 DEFAULT_MAIL_SUBJECT_PREFIX = "[激光扫描告警]"
 
+# ── 「邮件通知」任务里的那份设置（2026-10-28）──────────────────────────────
+# 邮件输入框只保留在「邮件通知」任务里；扫描任务的告警与「邮件测试」按钮
+# 都不再各自带一份邮件配置，而是由 agent 在运行时直接读这个任务的设置。
+MAIL_TASK_NAME = "邮件通知"
+MAIL_OPTION_NAME = "邮件设置"
+SCAN_TASK_NAME = "激光参数扫描"
+
+# 界面字段名 → agent 内部参数名。键名和 interface.json 里对应的 inputs 一一对应。
+# 2026-10-28 起，扫描设置被拆成可折叠的 checkbox 分组；MFA 折叠时不会把
+# 子 option 的 pipeline_override 传给 agent，所以这里再留一份「从任务配置读」的
+# 兜底：折叠只影响界面，不影响实际参数。
+SCAN_UI_KEY_MAP = {
+    "起始值": "start",
+    "结束值": "end",
+    "步长": "step",
+    "扫描点数": "count",
+    "等待秒数": "wait_sec",
+    "结果文件夹名": "csv_dir",
+    "结果文件名": "csv_name",
+    "输出总目录": "output_root",
+    "跑完自动打开": "open_when_done",
+    "读数校验": "enabled",
+    "绝对偏差阈值": "tolerance_abs",
+    "相对偏差阈值": "tolerance_pct",
+    "重测等待秒数": "retry_wait",
+    "连续异常次数": "retry_max",
+    "异常后继续测试": "continue_on_abnormal",
+    "读数异常发送邮件": "notify_enabled",
+    "读数采样": "sample_enabled",
+    "采样时长": "sample_window_sec",
+}
+
+# 这些值只用于「旧数据 vs 新建子 option 默认值」的取舍：
+# 用户没改过的新子项会带着默认值，不能拿它覆盖老版本里同一字段的自定义值。
+SCAN_DEFAULT_VALUES = {
+    "start": "20",
+    "end": "30",
+    "step": "1",
+    "count": "0",
+    "wait_sec": "10",
+    "csv_dir": "",
+    "csv_name": "",
+    "output_root": "output",
+    "open_when_done": "true",
+    "enabled": "true",
+    "tolerance_abs": "3.0",
+    "tolerance_pct": "1",
+    "retry_wait": "3",
+    "retry_max": "5",
+    "continue_on_abnormal": "true",
+    "notify_enabled": "true",
+    "sample_enabled": "true",
+    "sample_window_sec": "1",
+}
+
+# 界面字段名 → agent 内部参数名。键名和 interface.json 的「邮件设置」inputs 一一对应。
+MAIL_UI_KEY_MAP = {
+    "发送完成通知": "enabled",
+    "收件邮箱": "mail_to",
+    "SMTP账号": "smtp_user",
+    "SMTP密码": "smtp_password",
+    "SMTP服务器": "smtp_host",
+    "SMTP端口": "smtp_port",
+    "邮件主题前缀": "mail_subject_prefix",
+    "通知方式": "notify_mode",
+    "每次最多通知": "notify_limit",
+}
+
 # 一封告警信需要的全部字段。用它把「邮件设置」那一份参数整体搬进告警路径，
 # 避免再出现"Guard 只拿到半个配置 → 静默不发"（2026-10-27 实测事故）。
 MAIL_PARAM_KEYS = (
@@ -259,6 +328,8 @@ _state: dict[str, Any] = {
     # 窗口没动、截图尺寸没变就一直复用，尺寸一变立刻作废（不拿旧坐标硬认）。
     "value_box": None,  # {"box": [x, y, w, h], "layout": "right"/"below", "anchor": str, "size": [w, h]}
     "sample_stats": [],  # 最近一轮采样的统计 [{count, seconds, mean, span}]，写日志/摘要用
+    "sample_param": {},  # 折叠分组里读到的采样开关/时长（LaserReadValueB 兜底用）
+    "scan_settings_from_task": False,  # 本次 begin 是否从任务配置读到了折叠分组设置
     # ── 读数校验相关（见 _tolerance_ok / LaserSweepGuard）────────────────
     "last_measured": None,  # 上一次读数（原始值，未判定），校验层拿它当基准
     # 只有**判定正常**的读数才追加进 history。脏数据一旦进来，后面每一组都会
@@ -543,10 +614,20 @@ def _state_file() -> Path:
     return _resolve("laser_sweep_output.json")
 
 
-def _remember_output_root(root: Path) -> None:
+def _remember_output_root(root: Path, csv_path: Optional[Path] = None) -> None:
+    """记下「最近一次实际使用的输出总目录」，顺手记下这次的 CSV 路径。
+
+    2026-10-28 新增 last_csv：新任务「绘制曲线图」要默认画**最近导出的单个 CSV**。
+    只记 output_root 的话，它得在目录里按修改时间猜 —— 如果用户刚手动往
+    output 里放了一份旧数据，猜出来的就可能不是这次扫描的结果。直接记下
+    begin 时算好的 csv_path，任务一读就知道该画哪一份，和「最近一次扫描」严格对应。
+    """
+    payload: dict[str, Any] = {"output_root": str(root)}
+    if csv_path is not None:
+        payload["last_csv"] = str(csv_path)
     try:
         _state_file().write_text(
-            json.dumps({"output_root": str(root)}, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except OSError as exc:
@@ -563,6 +644,23 @@ def _recall_output_root() -> Optional[Path]:
     except (OSError, json.JSONDecodeError):
         return None
     raw = str(data.get("output_root") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _recall_last_csv() -> Optional[Path]:
+    """读回「最近一次扫描的 CSV 路径」（老状态文件里没有这个字段就返回 None）。
+
+    注意：这里**不检查文件是否存在** —— 调用方要负责判断，因为老文件可能
+    已经被使用者挪走/改名。返回 None 时才表示"状态文件根本没有这条记录"。
+    """
+    path = _state_file()
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = str(data.get("last_csv") or "").strip()
     return Path(raw) if raw else None
 
 
@@ -1435,32 +1533,338 @@ def _load_mail_config() -> dict[str, Any]:
     return data
 
 
-def _resolve_mail_param(param: dict[str, Any]) -> dict[str, Any]:
-    """解析「发信」需要的这一组参数：邮件设置（界面） > 本地配置 > 内置默认。
+# ── 从「邮件通知」任务的保存配置里读邮件设置（2026-10-28）──────────────────
+# 为什么需要这层：
+#   2026-10-28 起，「激光参数扫描」任务不再挂「邮件设置」option，
+#   「邮件测试」任务也只剩下按钮。MFA 不会把别的任务的 option 值传给当前任务，
+#   所以 agent 必须自己去读「邮件通知」任务保存下来的那一份配置。
+#
+# 读哪里：
+#   · MFAAvalonia 多实例布局：config/instances/*.json 的 TaskItems[].option[]
+#   · 老版单文件布局：config/maa_pi_config.json 的 task[].option
+# 多个实例时按「填得最完整」的候选优先；都差不多时取文件较新的那个。
+_MAIL_TASK_CONFIG_CACHE: dict[str, Any] = {"key": None, "data": {}}
 
-    为什么要独立成一个函数（2026-10-27 主人要求重构）：
-        邮件参数原本塞在「激光参数扫描」的 Guard 节点里，现在整体搬到
-        独立的「邮件通知」任务。两边必须解析同一份配置，才不会出现
-        「通知任务能发、扫描任务发不出」这种各说各话的状态。
+
+def _mail_task_config_files() -> list[Path]:
+    """列出可能保存「邮件通知」任务设置的配置文件（按修改时间新→旧）。"""
+    files: list[Path] = []
+    instances_dir = _resolve("config/instances")
+    try:
+        if instances_dir.is_dir():
+            files.extend(instances_dir.glob("*.json"))
+    except OSError:
+        pass
+
+    legacy = _resolve("config/maa_pi_config.json")
+    try:
+        if legacy.is_file():
+            files.append(legacy)
+    except OSError:
+        pass
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(files, key=_mtime, reverse=True)
+
+
+def _normalize_mail_ui_data(data: Any) -> dict[str, Any]:
+    """把界面上的中文键名转成 agent 内部参数名；只保留非空值。"""
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for ui_key, value in data.items():
+        target = MAIL_UI_KEY_MAP.get(str(ui_key))
+        if target is None or value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            result[target] = text
+    return result
+
+
+def _extract_mail_task_candidates(root: Any) -> list[dict[str, Any]]:
+    """从一份 MFA 实例配置里提取所有「邮件通知」任务的邮件设置候选。"""
+    if not isinstance(root, dict):
+        return []
+
+    tasks = root.get("TaskItems")
+    if not isinstance(tasks, list):
+        tasks = root.get("task")
+    if not isinstance(tasks, list):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("name") or "").strip() != MAIL_TASK_NAME:
+            continue
+
+        option = task.get("option")
+        data: Any = None
+        if isinstance(option, list):
+            for item in option:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip() != MAIL_OPTION_NAME:
+                    continue
+                data = item.get("data")
+                if isinstance(data, dict):
+                    break
+        elif isinstance(option, dict):
+            # 兼容老版：option 直接是 {"邮件设置": {...}} 或 {"邮件设置": {"data": {...}}}
+            raw = option.get(MAIL_OPTION_NAME)
+            if isinstance(raw, dict):
+                data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+
+        normalized = _normalize_mail_ui_data(data)
+        if normalized:
+            candidates.append(normalized)
+    return candidates
+
+
+def _load_mail_settings_from_email_task() -> dict[str, Any]:
+    """读「邮件通知」任务里保存的那份「邮件设置」。
+
+    返回值是 agent 内部键名（smtp_host / mail_to / ...）。读不到就返回空字典，
+    绝不抛异常 —— 这个函数可能在扫描异常终止的路径上被调用，不能制造新故障。
+    """
+    files = _mail_task_config_files()
+    cache_key: list[tuple[str, int, int]] = []
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        cache_key.append((str(path), stat.st_mtime_ns, stat.st_size))
+
+    if _MAIL_TASK_CONFIG_CACHE.get("key") == cache_key:
+        return dict(_MAIL_TASK_CONFIG_CACHE.get("data") or {})
+
+    best: dict[str, Any] = {}
+    best_score = -1
+    best_mtime = -1.0
+
+    for path in files:
+        try:
+            root = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for candidate in _extract_mail_task_candidates(root):
+            # 「收件邮箱 / SMTP账号 / SMTP服务器」三项最能说明这份配置是否真的可用；
+            # 密码常常留空（走本地 config/laser_sweep_mail.json），不参与打分。
+            score = sum(
+                1 for key in ("mail_to", "smtp_user", "smtp_host") if candidate.get(key)
+            )
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if score > best_score or (score == best_score and mtime > best_mtime):
+                best = candidate
+                best_score = score
+                best_mtime = mtime
+
+    _MAIL_TASK_CONFIG_CACHE.update(key=cache_key, data=best)
+    if best:
+        print(
+            "[laser_sweep] 已从「邮件通知」任务读取邮件设置："
+            f"{best.get('smtp_host') or '(服务器未填)'}"
+            f"，收件人 {best.get('mail_to') or '(未填)'}"
+            f"，授权码{'已填' if best.get('smtp_password') else '未填'}"
+        )
+    return dict(best)
+
+
+_SCAN_TASK_CONFIG_CACHE: dict[str, Any] = {"key": None, "data": {}}
+
+
+def _collect_option_data(option: Any, out: dict[str, Any]) -> None:
+    """递归收集一个 MFA option（含 sub_options）里的 data 字段。"""
+    if not isinstance(option, dict):
+        return
+    data = option.get("data")
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text != "":
+                out[str(key)] = value
+    sub_options = option.get("sub_options")
+    if isinstance(sub_options, list):
+        for sub in sub_options:
+            _collect_option_data(sub, out)
+
+
+def _extract_scan_task_settings(root: Any) -> list[dict[str, Any]]:
+    """从一份 MFA 配置里提取「激光参数扫描」任务的全部 option 数据。
+
+    返回的是「界面字段名 -> 值」的候选列表。兼容三种布局：
+      · v1.0.18+ 的折叠分组：父 checkbox 的 data + sub_options 里的 data
+      · v1.0.18 的扁平 input option：每个 option 自带 data
+      · 老版 maa_pi_config.json：task[].option 是 name -> data 的字典
+    """
+    if not isinstance(root, dict):
+        return []
+
+    tasks = root.get("TaskItems")
+    if not isinstance(tasks, list):
+        tasks = root.get("task")
+    if not isinstance(tasks, list):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("name") or "").strip() != SCAN_TASK_NAME:
+            continue
+
+        legacy: dict[str, Any] = {}
+        nested: dict[str, Any] = {}
+        option = task.get("option")
+
+        if isinstance(option, list):
+            for item in option:
+                if not isinstance(item, dict):
+                    continue
+                data = item.get("data")
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if value is not None and str(value).strip() != "":
+                            legacy[str(key)] = value
+                sub_options = item.get("sub_options")
+                if isinstance(sub_options, list):
+                    for sub in sub_options:
+                        _collect_option_data(sub, nested)
+        elif isinstance(option, dict):
+            for _name, raw in option.items():
+                if not isinstance(raw, dict):
+                    continue
+                data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+                for key, value in data.items():
+                    if value is not None and str(value).strip() != "":
+                        legacy[str(key)] = value
+
+        merged: dict[str, Any] = {}
+        # 先把老版本的扁平数据放进来
+        for ui_key, value in legacy.items():
+            target = SCAN_UI_KEY_MAP.get(ui_key)
+            if target is not None:
+                merged[target] = value
+        # 新子 option 的数据优先；但如果它只是新建时的默认值，而老版本有
+        # 同字段的自定义值，则保留老值（避免升级后悄悄变回默认）。
+        for ui_key, value in nested.items():
+            target = SCAN_UI_KEY_MAP.get(ui_key)
+            if target is None:
+                continue
+            text = str(value).strip()
+            if text == "":
+                continue
+            old = merged.get(target)
+            if old is None or text != SCAN_DEFAULT_VALUES.get(target, ""):
+                merged[target] = value
+
+        if merged:
+            candidates.append(merged)
+
+    return candidates
+
+
+def _load_scan_settings_from_task() -> dict[str, Any]:
+    """读取「激光参数扫描」任务保存的扫描/校验/采样设置。
+
+    这是折叠分组的关键兜底：checkbox 收起时，子 option 不会参与
+    `pipeline_override`，但配置仍然保存在任务文件里。agent 从任务配置读，
+    所以「收起」只影响界面显示，不会让扫描参数退回默认值。
+    """
+    files = _mail_task_config_files()
+    cache_key: list[tuple[str, int, int]] = []
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        cache_key.append((str(path), stat.st_mtime_ns, stat.st_size))
+
+    if _SCAN_TASK_CONFIG_CACHE.get("key") == cache_key:
+        return dict(_SCAN_TASK_CONFIG_CACHE.get("data") or {})
+
+    best: dict[str, Any] = {}
+    best_score = -1
+    best_mtime = -1.0
+
+    for path in files:
+        try:
+            root = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for candidate in _extract_scan_task_settings(root):
+            score = sum(1 for value in candidate.values() if str(value).strip() != "")
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if score > best_score or (score == best_score and mtime > best_mtime):
+                best = candidate
+                best_score = score
+                best_mtime = mtime
+
+    _SCAN_TASK_CONFIG_CACHE.update(key=cache_key, data=best)
+    return dict(best)
+
+
+def _merge_scan_settings_from_task(param: dict[str, Any]) -> dict[str, Any]:
+    """把「任务配置里保存的折叠分组设置」合并进节点参数。
+
+    pipeline_override 正常会传 UI 值；但折叠时子 option 不参与合并。
+    这里用任务配置兜底，保证两种状态下参数完全一致。
+    """
+    settings = _load_scan_settings_from_task()
+    if not settings:
+        _state["scan_settings_from_task"] = False
+        return param
+    merged = dict(param)
+    merged.update({key: value for key, value in settings.items() if value is not None})
+    _state["scan_settings_from_task"] = True
+    print(
+        "[laser_sweep] 已从任务设置读取折叠分组参数："
+        f"start={merged.get('start')} end={merged.get('end')} step={merged.get('step')}"
+    )
+    return merged
+
+
+def _resolve_mail_param(param: dict[str, Any]) -> dict[str, Any]:
+    """解析「发信」需要的这一组参数：本次节点 > 「邮件通知」任务设置 > 本地配置 > 默认。
+
+    为什么要独立成一个函数（2026-10-28 重构）：
+        邮件参数只在「邮件通知」任务里填一份；扫描任务的异常告警和「邮件测试」
+        按钮都没有自己的邮件输入项。agent 直接读取「邮件通知」任务的设置，
+        所以界面只需要维护一处，用户也不会看到重复的输入框。
 
     容错原则和 _resolve_guard_param 一致：任何一项填错都只让发信失败，
     绝不能让程序抛异常 —— 它跑在「扫描即将终止」这条路径上。
     """
     local = _load_mail_config() or {}
+    task_settings = _load_mail_settings_from_email_task() or {}
 
     def pick(ui_key: str, default: Any = "") -> Any:
-        """按「界面 > 本地文件 > 默认」取值。
+        """按「节点参数 > 邮件通知任务设置 > 本地文件 > 默认」取值。
 
         只对**空值**兜底：界面上填了就以界面为准。
         否则用户改了收件人，却发现信还发到旧地址 —— 那比不兜底更糟。
         """
-        raw = param.get(ui_key)
-        text = "" if raw is None else str(raw).strip()
-        if text:
-            return text
-        alt = local.get(ui_key)
-        if alt is not None and str(alt).strip():
-            return alt
+        for source in (param, task_settings, local):
+            raw = source.get(ui_key)
+            text = "" if raw is None else str(raw).strip()
+            if text:
+                return text
         return default
 
     port = int(_number(pick("smtp_port", DEFAULT_SMTP_PORT), DEFAULT_SMTP_PORT))
@@ -1476,20 +1880,37 @@ def _resolve_mail_param(param: dict[str, Any]) -> dict[str, Any]:
     if notify_limit < 0:
         notify_limit = 0
 
-    # 通知方式：界面 > 本地 > 默认。空值（界面上留空）就走默认的 auto。
-    mode_raw = str(param.get("notify_mode") or "").strip() or str(local.get("notify_mode") or "").strip()
+    # 通知方式：节点 > 邮件通知任务设置 > 本地 > 默认
+    mode_raw = ""
+    for source in (param, task_settings, local):
+        mode_raw = str(source.get("notify_mode") or "").strip()
+        if mode_raw:
+            break
+
+    def _flag_from_sources(key: str, default: bool) -> bool:
+        for source in (param, task_settings, local):
+            raw = source.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            return _flag(raw, default)
+        return default
 
     return {
         "notify_mode": _parse_notify_mode(mode_raw or DEFAULT_NOTIFY_MODE),
         "notify_mode_raw": mode_raw,
         "smtp_host": str(pick("smtp_host", "")).strip(),
         "smtp_port": port,
-        "smtp_ssl": _flag(param.get("smtp_ssl"), _flag(local.get("smtp_ssl"), DEFAULT_SMTP_SSL)),
+        "smtp_ssl": _flag_from_sources("smtp_ssl", DEFAULT_SMTP_SSL),
         # STARTTLS 只在用户显式开启、且没开 SSL 时才用得上（两者互斥）
-        "smtp_starttls": _flag(param.get("smtp_starttls"), _flag(local.get("smtp_starttls"), False)),
+        "smtp_starttls": _flag_from_sources("smtp_starttls", False),
         "smtp_user": str(pick("smtp_user", "")).strip(),
         # 密码不做任何加工：授权码里可能带特殊字符，strip 掉反而会认证失败
-        "smtp_password": str(param.get("smtp_password") or local.get("smtp_password") or ""),
+        "smtp_password": str(
+            param.get("smtp_password")
+            or task_settings.get("smtp_password")
+            or local.get("smtp_password")
+            or ""
+        ),
         "mail_to": str(pick("mail_to", "")).strip(),
         "mail_subject_prefix": str(pick("mail_subject_prefix", DEFAULT_MAIL_SUBJECT_PREFIX)).strip(),
         "timeout_sec": timeout_sec,
@@ -1552,12 +1973,12 @@ def _alert_mail_param(node_param: dict[str, Any]) -> dict[str, Any]:
         于是告警这条路径直接把自己的 param 交给 _resolve_mail_param 时，
         smtp_host / smtp_user / mail_to 全是空，_send_alert 判定"缺配置"、
         静默降级为 off —— 扫描跑完了、CSV 也写了空值，但**一封告警信都没有**。
-        而扫描结束时那封「完成通知」却发得出去（它拿到的是「邮件设置」的完整参数），
-        于是用户看到的现象是"别的信能收到，偏偏异常告警收不到"，很难自查。
+        而扫描结束时那封「完成通知」却发得出去，于是用户看到的现象是
+        "别的信能收到，偏偏异常告警收不到"，很难自查。
 
     合并顺序（前者优先）：
         ① 本次扫描开始时由 begin 存下的邮件参数（_state["mail_param"]）
-           —— 它就是界面「邮件设置」的完整内容，最权威；
+           —— 它就是「邮件通知」任务里「邮件设置」的完整内容，最权威；
         ② 节点自己带的字段（万一哪天有人把邮件参数又写回节点）；
         ③ 都不含的字段交给 _resolve_mail_param 去读本地 config 文件兜底。
     """
@@ -2589,7 +3010,7 @@ def _screencap_window(
 @AgentServer.custom_action("laser_sweep_begin")
 class LaserSweepBegin(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
-        param = _param(argv.custom_action_param)
+        param = _merge_scan_settings_from_task(_param(argv.custom_action_param))
 
         # 先把「这次跑的到底是哪份代码」写进日志。
         # 换机排查时最怕的就是「文件到底替换成功没有」—— 带上文件名、字节数和
@@ -2660,8 +3081,9 @@ class LaserSweepBegin(CustomAction):
 
         # 记下 output 总目录，收尾时「自动打开文件夹」要用它
         _state["out_root"] = out_root
-        # 顺手落盘一份，好让独立的「打开输出文件夹」任务也能打开同一个目录
-        _remember_output_root(out_root)
+        # 顺手落盘一份，好让独立的「打开输出文件夹」和图「绘制曲线图」任务
+        # 也能找到同一个目录 / 同一份 CSV
+        _remember_output_root(out_root, csv_path)
         # 跑完是否自动打开 output 文件夹（UI 上的开关，默认开）
         _state["open_when_done"] = _flag(param.get("open_when_done"), True)
 
@@ -2683,32 +3105,36 @@ class LaserSweepBegin(CustomAction):
         guard_param = _resolve_guard_param(param)
         _state["guard_param"] = guard_param
 
-        # ── 把「邮件设置」存一份，供告警路径使用 ───────────────────────────
-        # 为什么在 begin 存：Guard 节点的参数里只有阈值/次数/开关，
-        # 没有 smtp_* / mail_to（它们属于独立的「邮件设置」）。
-        # 告警要发信时必须拿到这份配置，否则会静默降级为"不发"
-        # （2026-10-27 实测事故，见 _alert_mail_param 的注释）。
+        # ── 把「邮件通知」任务的设置存一份，供告警路径使用 ─────────────────
+        # 2026-10-28 起主任务不再挂「邮件设置」：
+        #   邮件信息只在「邮件通知」任务里填一份，这里开始扫描时直接去读
+        #   那份保存好的配置。这样监控告警和完成通知永远用同一份设置，
+        #   主任务界面也不会再出现重复的邮件输入框。
         #
-        # 只存非空字段：留空表示"这一项没配"，让 _resolve_mail_param 还能
-        # 退到本地 config 文件兜底 —— 存成空字符串会把兜底路径挡掉。
-        mail_seed = {
-            key: param[key]
-            for key in MAIL_PARAM_KEYS
-            if param.get(key) is not None and str(param.get(key)).strip() != ""
-        }
+        # 节点参数里的邮件字段只作为兜底（正常不会再有），优先级最高。
+        mail_seed = dict(_load_mail_settings_from_email_task() or {})
+        for key in MAIL_PARAM_KEYS:
+            if param.get(key) is not None and str(param.get(key)).strip() != "":
+                mail_seed[key] = param[key]
         _state["mail_param"] = mail_seed
         if mail_seed:
             print(
-                "[laser_sweep] 告警邮件：已从「邮件设置」读到 "
+                "[laser_sweep] 告警邮件：已从「邮件通知」任务读到设置 "
                 f"{mail_seed.get('smtp_host') or '(服务器未填)'}"
                 f"，收件人 {mail_seed.get('mail_to') or '(未填)'}"
                 f"，授权码{'已填' if mail_seed.get('smtp_password') else '未填'}"
             )
         else:
             print(
-                "[laser_sweep] ⚠️ 没从「邮件设置」读到任何邮件参数 —— "
+                "[laser_sweep] ⚠️ 没从「邮件通知」任务读到邮件设置 —— "
                 "读数异常时可能发不出告警信（会尝试读本地 config 文件兜底）"
             )
+
+        sample_param = {
+            key: param.get(key)
+            for key in ("sample_enabled", "sample_window_sec")
+            if param.get(key) is not None
+        }
 
         _state.update(
             values=values,
@@ -2716,6 +3142,7 @@ class LaserSweepBegin(CustomAction):
             csv_path=csv_path,
             measured=None,
             controls=None,
+            sample_param=sample_param,
             # 每次扫描都重新定位 B 软件的数值框：上次那个窗口可能已经关了、
             # 换软件了，或者窗口尺寸变了 —— 拿旧坐标去认只会认出错数。
             value_box=None,
@@ -3772,6 +4199,13 @@ class LaserReadValueB(CustomRecognition):
         argv: CustomRecognition.AnalyzeArg,
     ) -> CustomRecognition.AnalyzeResult:
         param = _param(argv.custom_recognition_param)
+        # 折叠分组时子 option 的 pipeline_override 不会合并进来；
+        # begin 已从任务配置里读到采样开关/时长，存在 _state["sample_param"] 里。
+        sample_state = _state.get("sample_param")
+        if isinstance(sample_state, dict):
+            for key in ("sample_enabled", "sample_window_sec"):
+                if sample_state.get(key) is not None:
+                    param[key] = sample_state[key]
         mode = str(param.get("mode", "fixed")).lower()
 
         if mode == "fixed":
@@ -4220,9 +4654,16 @@ class LaserSweepGuard(CustomAction):
         raw = _param(argv.custom_action_param)
         fallback = _state.get("guard_param")
         if isinstance(fallback, dict) and fallback:
-            merged = dict(fallback)
-            merged.update({k: v for k, v in raw.items() if v is not None})
-            raw = merged
+            # begin 已从任务配置读到折叠分组参数时，以它为准（折叠只是隐藏 UI，
+            # 不能让子 option 不参与 pipeline 合并后退回节点默认值）。
+            if _state.get("scan_settings_from_task"):
+                merged = dict(raw)
+                merged.update({k: v for k, v in fallback.items() if v is not None})
+                raw = merged
+            else:
+                merged = dict(fallback)
+                merged.update({k: v for k, v in raw.items() if v is not None})
+                raw = merged
         param = _resolve_guard_param(raw)
         node = str(getattr(argv, "node_name", "") or "LaserSweepGuard")
         record_node = param["record_node"]
@@ -4576,7 +5017,8 @@ class LaserSweepAbnormalStop(CustomAction):
 
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
         param = _param(argv.custom_action_param)
-        retry_max = int(_number(param.get("retry_max"), DEFAULT_RETRY_MAX))
+        guard_state = _state.get("guard_param") if isinstance(_state.get("guard_param"), dict) else {}
+        retry_max = int(_number(param.get("retry_max"), guard_state.get("retry_max", DEFAULT_RETRY_MAX)))
         if retry_max < 1:
             retry_max = DEFAULT_RETRY_MAX
 
@@ -4815,7 +5257,13 @@ class LaserSweepSendSummary(CustomAction):
         param = _param(argv.custom_action_param)
         print("[laser_sweep] ── 邮件通知任务 ──")
 
-        if not _flag(param.get("enabled"), True):
+        # 「发送完成通知」开关：正常由「邮件设置」option 传进来；
+        # 若节点参数里没有（例如以后又拆掉 option），就从「邮件通知」任务保存的
+        # 设置里读，保证这个开关永远只有一个真源。
+        enabled_raw = param.get("enabled")
+        if enabled_raw is None:
+            enabled_raw = _load_mail_settings_from_email_task().get("enabled")
+        if not _flag(enabled_raw, True):
             print("[laser_sweep] 「发送完成通知」是关的，跳过（任务正常结束）")
             return True
 
@@ -4947,9 +5395,13 @@ class LaserSweepFinish(CustomAction):
         print(f"[laser_sweep] 扫描结束，结果文件：{csv_path}")
 
         # 跑完自动打开 output 总目录（UI 上可以关掉）。
-        # 取 _state 里存的那份，node 参数没传时也能用；默认开。
-        want = param.get("open_when_done")
-        open_it = _flag(want, True) if want is not None else bool(_state.get("open_when_done", True))
+        # 折叠分组的设置由 begin 从任务配置读到 _state；优先用它，避免折叠时
+        # 子 option 不参与 pipeline 合并而退回节点默认 true。
+        if _state.get("scan_settings_from_task"):
+            open_it = bool(_state.get("open_when_done", True))
+        else:
+            want = param.get("open_when_done")
+            open_it = _flag(want, True) if want is not None else bool(_state.get("open_when_done", True))
         if open_it:
             root = _state.get("out_root")
             if root is None and csv_path is not None:
@@ -4972,7 +5424,7 @@ class LaserSweepOpenOutput(CustomAction):
     """
 
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
-        param = _param(argv.custom_action_param)
+        param = _merge_scan_settings_from_task(_param(argv.custom_action_param))
 
         # 依次尝试三个来源：本次会话 → 落盘的记录 → 默认 output/
         root = _state.get("out_root")
@@ -4989,6 +5441,162 @@ class LaserSweepOpenOutput(CustomAction):
         print(f"[laser_sweep] 打开输出文件夹：{root}")
         if not _open_folder(Path(root)):
             return False
+        return True
+
+
+# --------------------------------------------------------------------------- #
+# ④e 独立的「绘制曲线图」任务（2026-10-28 新增）
+#
+# 为什么是独立任务：
+#   主人要求「该功能需要独立于主要任务」。绘图是**事后消费**结果的动作，
+#   不该混进扫描的流水线 —— 扫描要一两个小时，绘图只在一两秒内完成；
+#   把绘图挂到扫描收尾会让「主任务失败 = 图也出不来」，而实际上只要 CSV 还在，
+#   随时都可以重新画。
+#
+# 默认画哪一份 CSV（主人要求「默认选择最近导出的单个 CSV」）：
+#   ① 同一个 agent 进程里刚跑完扫描 → _state["csv_path"]；
+#   ② 否则读 laser_sweep_output.json 里的 last_csv（扫描 begin 时写的）；
+#   ③ 再否则在 output 总目录里找修改时间最新的一个 .csv。
+#   用户也可以在「绘图设置」里填一个具体 CSV（或目录，取目录里最新的）。
+# --------------------------------------------------------------------------- #
+def _resolve_plot_csv(param: dict[str, Any]) -> Optional[Path]:
+    """决定「绘制曲线图」任务要画哪一份 CSV。
+
+    返回 None 表示找不到；调用方打印的日志已经说明了该去哪里补。
+    """
+    raw = str(param.get("source_csv") or "").strip().strip('"').strip("'")
+    if raw:
+        target = _resolve(raw)
+        if target.is_dir():
+            from plot_curve import find_latest_csv
+
+            latest = find_latest_csv(target)
+            if latest is None:
+                print(f"[laser_sweep] 指定的目录里没找到任何 CSV：{target}")
+                return None
+            print(f"[laser_sweep] 指定的是目录，自动选里面最新的 CSV：{latest}")
+            return latest
+        if not target.is_file():
+            print(f"[laser_sweep] 指定的 CSV 不存在：{target}")
+            return None
+        print(f"[laser_sweep] 使用界面指定的 CSV：{target}")
+        return target
+
+    # ① 本进程刚扫完（最准确：就是这次 begin 算出来的那个路径）
+    session_csv = _state.get("csv_path")
+    if isinstance(session_csv, Path) and session_csv.is_file():
+        print(f"[laser_sweep] 使用本次扫描的 CSV：{session_csv}")
+        return session_csv
+
+    # ② 落盘记录的上一次扫描
+    last_csv = _recall_last_csv()
+    if last_csv is not None and last_csv.is_file():
+        print(f"[laser_sweep] 使用上次扫描记录的 CSV：{last_csv}")
+        return last_csv
+
+    # ③ 在可能的 output 总目录里找最新的 CSV
+    from plot_curve import find_latest_csv
+
+    roots: list[Path] = []
+    remembered = _recall_output_root()
+    if remembered is not None:
+        roots.append(remembered)
+    try:
+        settings = _load_scan_settings_from_task()
+    except Exception:  # noqa: BLE001 - 纯兜底路径，读不到就用默认值
+        settings = {}
+    root_raw = str((settings or {}).get("output_root") or "").strip()
+    if root_raw:
+        roots.append(_resolve(root_raw))
+    roots.append(_resolve(OUTPUT_ROOT_NAME))
+
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        latest = find_latest_csv(root)
+        if latest is not None:
+            print(f"[laser_sweep] 自动选择 output 目录里最新的 CSV：{latest}")
+            return latest
+
+    print("[laser_sweep] 找不到可绘制的 CSV：")
+    print(f"[laser_sweep]   看过的目录：{'、'.join(str(p) for p in roots)}")
+    print("[laser_sweep]   请先在「激光参数扫描」任务里跑一次，或在「绘图设置」里填写 CSV 路径")
+    return None
+
+
+@AgentServer.custom_action("laser_sweep_plot_curve")
+class LaserSweepPlotCurve(CustomAction):
+    """「绘制曲线图」任务：CSV → 温度-输出功率曲线 PNG（存在 CSV 同目录）。
+
+    它完全不依赖扫描流程是否正在跑：只要磁盘上有一份扫描导出的 CSV 就能用。
+    真正的绘图逻辑在 agent/plot_curve.py（纯 stdlib + Windows GDI+），
+    这里只负责「选文件、调绘图、打日志、按需打开图片」。
+    """
+
+    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        param = _param(argv.custom_action_param)
+        print("[laser_sweep] ── 绘制曲线图任务 ──")
+
+        csv_path = _resolve_plot_csv(param)
+        if csv_path is None:
+            return False
+
+        # 延迟导入：绘图模块缺失时只让这一个任务失败，不拖垮整个 agent
+        # （热修复包漏发 agent/plot_curve.py 时的兜底提示就靠这里）。
+        try:
+            import plot_curve
+        except Exception as exc:  # noqa: BLE001 - 任何导入错误都按任务失败处理
+            print(f"[laser_sweep] ✗ 绘图模块加载失败：{type(exc).__name__}: {exc}")
+            print("[laser_sweep]   热修复包需要包含 agent/plot_curve.py（和 laser_sweep.py 同目录）")
+            return False
+
+        # 图片文件名：留空 = <CSV 文件名>_曲线.png；填了就照填的来（仍强制同目录）
+        image_name = str(param.get("image_name") or "").strip().strip('"').strip("'")
+        image_path: Optional[Path] = None
+        if image_name:
+            safe_name = _sanitize_name(_expand_time_format(image_name), "")
+            if not safe_name:
+                safe_name = f"{csv_path.stem}_曲线"
+            if not safe_name.lower().endswith(".png"):
+                safe_name += ".png"
+            image_path = csv_path.parent / safe_name
+
+        try:
+            stat = csv_path.stat()
+            print(
+                f"[laser_sweep] CSV：{csv_path}"
+                f"（{stat.st_size} 字节，改于 {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}）"
+            )
+            result = plot_curve.plot_csv(csv_path, image_path)
+        except plot_curve.PlotError as exc:
+            print(f"[laser_sweep] ✗ 绘制失败：{exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001 - 绘图任务不能把整个进程带崩
+            print(f"[laser_sweep] ✗ 绘制时出现意外错误：{type(exc).__name__}: {exc}")
+            return False
+
+        print(
+            f"[laser_sweep] 数据：X = 「{result['x_header']}」，Y = 「{result['y_header']}」，"
+            f"有效点 {result['points']} 个"
+            + (f"，跳过空值 {result['skipped']} 行" if result["skipped"] else "")
+        )
+        print(
+            f"[laser_sweep] 范围：温度 {_fmt(result['x_min'])} ~ {_fmt(result['x_max'])}，"
+            f"功率 {_fmt(result['y_min'])} ~ {_fmt(result['y_max'])}"
+        )
+        print(
+            f"[laser_sweep] ✅ 曲线图已保存：{result['image_path']}"
+            f"（{max(1, result['size'] // 1024)} KB）"
+        )
+
+        if _flag(param.get("open_when_done"), True):
+            if plot_curve.open_image(result["image_path"]):
+                print("[laser_sweep] 已用默认看图软件打开图片")
+            else:
+                print("[laser_sweep] 提示：没能自动打开图片，请到上面的路径手动查看")
         return True
 
 

@@ -560,7 +560,7 @@ pipeline = json.loads(
     )
 )
 
-override = (interface["option"]["扫描设置"].get("pipeline_override") or {}).get(
+override = (interface["option"]["读数采样项"].get("pipeline_override") or {}).get(
     "LaserSweepReadValueB"
 )
 check("界面覆盖了读数节点（否则采样开关在界面上改了也不生效）", isinstance(override, dict),
@@ -587,9 +587,14 @@ if isinstance(override, dict):
     }
     check("其余常量字段与 pipeline 默认值一致（两处不能各说各话）", drift == {}, str(drift))
 
-    inputs = {i["name"] for i in interface["option"]["扫描设置"]["inputs"]}
+    inputs = {i["name"] for i in interface["option"]["读数采样项"]["inputs"]}
     check("「读数采样」在界面上有对应输入项", "读数采样" in inputs, str(sorted(inputs)))
     check("「采样时长」在界面上有对应输入项", "采样时长" in inputs, str(sorted(inputs)))
+    _sample_parent = interface["option"]["读数采样"]
+    check("「读数采样」是折叠分组（checkbox + 展开设置按钮）",
+          _sample_parent.get("type") == "checkbox"
+          and any("读数采样项" in (c.get("option") or []) for c in _sample_parent.get("cases", [])),
+          str(_sample_parent.get("type")))
 
 # --------------------------------------------------------------------------- #
 # ⑦b 一个节点只许被一处 override 覆盖
@@ -619,7 +624,7 @@ check("没有任何节点被两个 option 同时覆盖（否则字段会被整�
       _conflicts == {}, str(_conflicts))
 
 # LaserSweepStart 必须完整带上扫描参数 —— 少一个就等于把它抹成代码默认值
-_start_ov = (interface["option"]["扫描设置"].get("pipeline_override") or {}).get(
+_start_ov = (interface["option"]["扫描设置项"].get("pipeline_override") or {}).get(
     "LaserSweepStart", {}
 ).get("custom_action_param", {})
 _scan_fields = ("start", "end", "step", "count", "wait_sec",
@@ -634,18 +639,49 @@ check("步长确实来自界面占位符", _start_ov.get("step") == "{步长}", 
 check("扫描点数确实来自界面占位符", _start_ov.get("count") == "{扫描点数}",
       str(_start_ov.get("count")))
 
-# 告警要用的邮件字段也必须在同一份 override 里（跨 option 引用占位符是允许的）
-_mail_fields = ("smtp_host", "smtp_user", "smtp_password", "mail_to")
-_missing_mail = [k for k in _mail_fields if k not in _start_ov]
-check("告警邮件字段也在同一份 LaserSweepStart 覆盖块里",
-      _missing_mail == [], str(_missing_mail))
+# 2026-10-28：主任务不再写任何邮件字段，邮件配置只在「邮件通知」任务里维护。
+_mail_fields = ("smtp_host", "smtp_user", "smtp_password", "mail_to",
+                "notify_mode", "mail_subject_prefix")
+_leaked_mail = [k for k in _mail_fields if k in _start_ov]
+check("LaserSweepStart 覆盖块里没有邮件字段（邮件设置只在「邮件通知」任务里填）",
+      _leaked_mail == [], str(_leaked_mail))
 
-# 扫参任务确实挂了「邮件设置」，但输入项只有一个来源（不会让用户填两遍）
+# 主任务只挂三个扫描相关 option，不再出现邮件输入框。
 _scan_task = next(t for t in interface["task"] if t["name"] == "激光参数扫描")
-check("扫描任务挂了「邮件设置」（否则告警拿不到 SMTP）",
-      "邮件设置" in (_scan_task.get("option") or []), str(_scan_task.get("option")))
-check("扫描任务仍挂着「扫描设置」", "扫描设置" in (_scan_task.get("option") or []),
-      str(_scan_task.get("option")))
+_scan_opts = _scan_task.get("option") or []
+check("扫描任务挂的是「扫描设置 / 读数校验 / 读数采样」",
+      _scan_opts == ["扫描设置", "读数校验", "读数采样"], str(_scan_opts))
+check("扫描任务没有「邮件设置」", "邮件设置" not in _scan_opts, str(_scan_opts))
+_scan_parent = interface["option"]["扫描设置"]
+check("「扫描设置」是折叠分组（checkbox + 展开设置按钮）",
+      _scan_parent.get("type") == "checkbox"
+      and any("扫描设置项" in (c.get("option") or []) for c in _scan_parent.get("cases", [])),
+      str(_scan_parent.get("type")))
+_check_parent = interface["option"]["读数校验"]
+check("「读数校验」是折叠分组（checkbox + 展开设置按钮）",
+      _check_parent.get("type") == "checkbox"
+      and any("读数校验项" in (c.get("option") or []) for c in _check_parent.get("cases", [])),
+      str(_check_parent.get("type")))
+
+# 邮件信息只保留在「邮件通知」任务里；「邮件测试」只是按钮，不重复存一份配置。
+_mail_task = next(t for t in interface["task"] if t["name"] == "邮件通知")
+_mail_test_task = next(t for t in interface["task"] if t["name"] == "邮件测试")
+check("「邮件通知」任务挂「邮件设置」（唯一填写入口）",
+      (_mail_task.get("option") or []) == ["邮件设置"], str(_mail_task.get("option")))
+check("「邮件测试」任务不挂 option（按钮只读邮件通知的配置）",
+      not _mail_test_task.get("option"), str(_mail_test_task.get("option")))
+
+# 读数校验的 Guard 覆盖块必须把界面输入项都带上，且不含 smtp 字段。
+_guard_ov = (interface["option"]["读数校验项"].get("pipeline_override") or {}).get(
+    "LaserSweepGuard", {}
+).get("custom_action_param", {})
+_guard_fields = ("enabled", "tolerance_abs", "tolerance_pct", "retry_wait", "retry_max",
+                 "notify_enabled", "continue_on_abnormal")
+_missing_guard = [k for k in _guard_fields if k not in _guard_ov]
+check("读数校验的 Guard 覆盖块字段齐全", _missing_guard == [], str(_missing_guard))
+check("读数校验的 Guard 覆盖块没有 smtp 字段",
+      not any(k.startswith("smtp_") or k == "mail_to" for k in _guard_ov),
+      str([k for k in _guard_ov if k.startswith("smtp_") or k == "mail_to"]))
 
 # 采样默认值本身也要能过一遍解析，别写出一个认不出来的值
 guard_like = ls._flag(pipeline["LaserSweepReadValueB"]["custom_recognition_param"].get("sample_enabled"), True)

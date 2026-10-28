@@ -7,7 +7,9 @@
 
     dist/LaserControlAuto-<version>-hotfix-files.zip
       agent/laser_sweep.py
+      agent/plot_curve.py
       resource/pipeline/my_task.json
+      resource/image/maalaser-logo_512.png
       interface.json
 
 zip 里**不带 install/ 前缀**（跟整包一样）—— 用户解压出来直接覆盖到
@@ -59,9 +61,11 @@ interface_path = install_path / "interface.json"
 
 # 默认打进热修复包的文件，路径相对 install/，也就是用户程序目录里的路径。
 #
-# 这三样分别对应「一层」：
+# 这几样分别对应「一层」：
 #   agent/laser_sweep.py            逻辑层：定位、读数、扫参序列
+#   agent/plot_curve.py             绘图层：CSV → 曲线 PNG（「绘制曲线图」任务）
 #   resource/pipeline/my_task.json  流程层：节点、延时、默认参数
+#   resource/image/maa...png        图标层：interface.json 的 icon 指向它
 #   interface.json                  界面层：UI 输入项 + pipeline_override
 #
 # ⚠️ interface.json 是 2026-10-14 补进来的：此前只发前两个，导致
@@ -69,7 +73,9 @@ interface_path = install_path / "interface.json"
 #    （输入框定义在 interface.json 里，agent 只是接收方）。
 DEFAULT_FILES = [
     "agent/laser_sweep.py",
+    "agent/plot_curve.py",
     "resource/pipeline/my_task.json",
+    "resource/image/maalaser-logo_512.png",
     "interface.json",
 ]
 

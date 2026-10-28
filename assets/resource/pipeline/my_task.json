@@ -754,6 +754,38 @@
         "post_delay": 0
     },
 
+    // ---------- ⑰b 「绘制曲线图」—— 独立任务（2026-10-28 新增）----------
+    // 做什么：把扫描导出的 CSV 画成曲线图（X = 温度 / CSV 的「设定参数」列，
+    //         Y = B 软件读数 / CSV 的「B软件测量值」列），PNG 存到 CSV 同目录。
+    //
+    // 为什么独立于主任务：
+    //   ① 绘图是事后动作，不参与「设参数 → 等稳定 → 读数 → 写 CSV」的循环；
+    //   ② 只要 CSV 还在，随时可以重画（不用重跑一两小时的扫描）；
+    //   ③ 绘图失败也绝不能影响扫描 —— 这里是单独的入口节点。
+    //
+    // 默认画哪一份：「最近导出的单个 CSV」。优先级见 agent 的 _resolve_plot_csv：
+    //   本次会话扫描过 → laser_sweep_output.json 里的 last_csv → output 里最新的 CSV。
+    // 用户也可以在「绘图设置」里填具体 CSV（或目录，自动取目录里最新的）。
+    //
+    // ⚠️ custom_action_param 的字段必须与 interface.json「绘图设置」里的
+    //    pipeline_override 完全一致 —— override 是整体替换，少一个就丢一个。
+    "LaserSweepPlotCurve": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_plot_curve",
+        "custom_action_param": {
+            // 留空 = 自动选择最近导出的单个 CSV
+            "source_csv": "",
+            // 留空 = <CSV 文件名>_曲线.png（永远和 CSV 同目录）
+            "image_name": "",
+            // 画完是否用系统默认看图软件打开
+            "open_when_done": true
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0
+    },
+
     // ---------- 出错时中止：打印原因 + 已有的 CSV 路径 ----------
     "LaserSweepAbort": {
         "recognition": "DirectHit",
