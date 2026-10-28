@@ -587,17 +587,17 @@ CSV 用 UTF-8 BOM 编码，Excel 双击打开不乱码：
 
 ```bash
 python tools/prepare_embedded_python.py
-python tools/install.py v1.0.8 win x86_64
+python tools/install.py v1.0.17 win x86_64
 python tools/pack_zip.py
 ```
 
-产物在 `dist/LaserControlAuto-win-x86_64-v1.0.8.zip`。
+产物在 `dist/LaserControlAuto-win-x86_64-v1.0.17.zip`。
 
 **CI 自动打包**：打一个 tag 推上去，GitHub Actions 会自动打包 Windows x64 版并创建 Release。
 
 ```bash
-git tag v1.0.8
-git push origin v1.0.8
+git tag v1.0.17
+git push origin v1.0.17
 ```
 
 ### 热修复包
@@ -605,10 +605,10 @@ git push origin v1.0.8
 只改了 agent、流水线或界面配置时，不必重发全部内容，可以只打一个几十 KB 的覆盖包：
 
 ```bash
-python tools/pack_hotfix.py v1.0.8
+python tools/pack_hotfix.py v1.0.17
 ```
 
-产物 `dist/LaserControlAuto-v1.0.8-hotfix-files.zip` 里包含三个文件：
+产物 `dist/LaserControlAuto-v1.0.17-hotfix-files.zip` 里包含三个文件：
 
 | 文件 | 负责 |
 | --- | --- |
