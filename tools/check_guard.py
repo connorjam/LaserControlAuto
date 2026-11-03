@@ -564,6 +564,41 @@ for i, v in enumerate([-95.0, -797.2, -250.0, -400.0, -14.2]):
 check("判废后跳的是 Advance（不是 Record）—— 否则空值行会写两遍",
       final_ctx.last_next == ["LaserSweepAdvance"], str(final_ctx.last_next))
 
+# ── 判废时保留最后读数（2026-10-29，默认） vs 写空值（旧行为） ─────────
+print()
+_reset_csv = WORKSPACE / "debug" / "_check_guard_keep.csv"
+_reset_csv.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
+reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72])
+ls._state["csv_path"] = _reset_csv
+_keep_ctx = FakeContext()
+for _v in [-95.0, -797.2, -250.0, -400.0, -14.2]:
+    ls._state["measured"] = _v
+    _keep_ctx = FakeContext()
+    guard_action(_keep_ctx, retry_max=5)  # 默认 keep_abnormal=True
+    if _keep_ctx.last_next in (["LaserSweepAdvance"], ["LaserSweepAbnormalStop"]):
+        break
+_keep_rows = _reset_csv.read_text(encoding="utf-8-sig").strip().splitlines()
+_keep_cols = _keep_rows[1].split(",") if len(_keep_rows) == 2 else []
+check("默认判废：CSV 不是空值，保留最后读数 -14.2",
+      len(_keep_cols) == 5 and _keep_cols[2] == "-14.2", str(_keep_rows))
+check("默认判废：备注标明保留读数",
+      len(_keep_cols) == 5 and "保留读数" in _keep_cols[4], str(_keep_cols))
+_reset_csv.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
+
+reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72])
+ls._state["csv_path"] = _reset_csv
+_blank_ctx = FakeContext()
+for _v in [-95.0, -797.2, -250.0, -400.0, -14.2]:
+    ls._state["measured"] = _v
+    _blank_ctx = FakeContext()
+    guard_action(_blank_ctx, retry_max=5, keep_abnormal=False)
+    if _blank_ctx.last_next in (["LaserSweepAdvance"], ["LaserSweepAbnormalStop"]):
+        break
+_blank_rows = _reset_csv.read_text(encoding="utf-8-sig").strip().splitlines()
+check("关掉保留后判废：CSV 写空值",
+      len(_blank_rows) == 2 and _blank_rows[1].split(",")[2] == "", str(_blank_rows))
+_reset_csv.unlink(missing_ok=True)
+
 
 reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72])
 ctx = FakeContext()
@@ -618,6 +653,24 @@ check("正文含 CSV 路径", "result.csv" in body, "")
 check("正文含阈值说明", "10" in body and ("1.0" in body or "1" in body), "")
 check("主题带上「告警」字样", "告警" in info["subject"], info["subject"])
 check("主题能一眼看出是哪台/哪次", bool(info["subject"].strip()))
+
+info_keep = ls._compose_alert(
+    values=["20", "21", "22", "23", "24", "25"],
+    index=2,
+    history=[20.1, 21.4],
+    abnormal=[-95.0, -94.2, -96.7, -95.5, -94.8],
+    reference=-79.72,
+    tolerance_abs=1.0,
+    tolerance_pct=10.0,
+    elapsed_sec=1.0,
+    csv_path="result.csv",
+    started_at="2026-10-26 16:00:00",
+    retry_max=5,
+    continuing=True,
+    keeping=True,
+)
+check("保留异常读数时，告警正文说明 CSV 保留最后读数",
+      "保留的是最后一次异常读数" in info_keep["body"], info_keep["body"][:120])
 
 
 # --------------------------------------------------------------------------- #
@@ -748,27 +801,77 @@ check("失败时仍然打了日志（不是静默失败）", len(logged.strip())
 
 
 # --------------------------------------------------------------------------- #
-# ⑩ 终止节点
+# ⑩ 终止节点 + 异常读数保留（2026-10-29 新增）
 # --------------------------------------------------------------------------- #
 print()
 print("=" * 78)
-print("⑩ 终止节点：写空值占位 + 停止任务")
+print("⑩ 终止节点：默认保留最后读数 / 可切回空值，并停止任务")
 print("=" * 78)
 
+# ── 默认：keep_abnormal 不传 = True → 保留最后读数 ────────────────────
 reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72],
             alert={"ok": True, "channel": "email"})
 ctx = FakeContext()
 # 让 _append_row 写到临时文件，别动真实结果
 csv_path = WORKSPACE / "debug" / "_check_guard_stop.csv"
-csv_path.write_text("序号,设定参数,B软件测量值,时间\n", encoding="utf-8-sig")
+csv_path.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
 ls._state["csv_path"] = csv_path
 try:
     ok = bool(ls.LaserSweepAbnormalStop().run(ctx, FakeArg({"retry_max": 5}, "LaserSweepAbnormalStop")))
     check("终止动作返回 True（不是失败）", ok is True)
     check("已经请求停止整个任务", ctx.stopped is True)
     rows = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
-    check("当前这组写了空值占位（行号与参数仍一一对应）",
+    cols = rows[1].split(",") if len(rows) == 2 else []
+    check("默认保留最后读数（不是空值）",
+          len(cols) == 5 and cols[2] == "-95", str(rows))
+    check("备注列标明「保留读数」", len(cols) == 5 and "保留读数" in cols[4], str(cols))
+finally:
+    csv_path.unlink(missing_ok=True)
+
+# ── 显式关闭：keep_abnormal=False → 空值占位（旧行为） ───────────────
+reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72],
+            alert={"ok": True, "channel": "email"})
+ctx = FakeContext()
+csv_path = WORKSPACE / "debug" / "_check_guard_stop_blank.csv"
+csv_path.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
+ls._state["csv_path"] = csv_path
+try:
+    ok = bool(ls.LaserSweepAbnormalStop().run(
+        ctx, FakeArg({"retry_max": 5, "keep_abnormal": False}, "LaserSweepAbnormalStop")
+    ))
+    check("关掉保留后终止动作仍返回 True", ok is True)
+    rows = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
+    check("关掉「保留异常读数」→ 写空值占位",
           len(rows) == 2 and rows[1].split(",")[2] == "", str(rows))
+finally:
+    csv_path.unlink(missing_ok=True)
+
+# ── 读数据失败（RecordFailed）：有旧值则默认保留，没值才留空 ─────────
+print()
+reset_state(measured=-95.0, last_measured=-79.72, history=[-79.72])
+csv_path = WORKSPACE / "debug" / "_check_guard_record_failed.csv"
+csv_path.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
+ls._state["csv_path"] = csv_path
+try:
+    ok = bool(ls.LaserSweepRecordFailed().run(
+        FakeContext(), FakeArg({}, "LaserSweepRecordFailed")
+    ))
+    rows = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
+    cols = rows[1].split(",") if len(rows) == 2 else []
+    check("RecordFailed 默认保留本组上次读数",
+          ok is True and len(cols) == 5 and cols[2] == "-95", str(rows))
+    check("RecordFailed 备注标明保留",
+          len(cols) == 5 and "保留本组上次读数" in cols[4], str(cols))
+
+    # 一个数都没读到 → 没有可保留的值，仍写空值
+    ls._state["measured"] = None
+    csv_path.write_text("序号,设定参数,B软件测量值,时间,备注\n", encoding="utf-8-sig")
+    ok = bool(ls.LaserSweepRecordFailed().run(
+        FakeContext(), FakeArg({"keep_abnormal": True}, "LaserSweepRecordFailed")
+    ))
+    rows = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
+    check("RecordFailed 无任何读数时仍写空值",
+          ok is True and len(rows) == 2 and rows[1].split(",")[2] == "", str(rows))
 finally:
     csv_path.unlink(missing_ok=True)
 
@@ -879,6 +982,11 @@ check("Guard 参数里没有任何 smtp_* 字段",
       not any(k.startswith("smtp_") for k in g), str([k for k in g if k.startswith("smtp_")]))
 check("Guard 参数里没有 mail_to",
       "mail_to" not in g, str([k for k in g if k.startswith("mail")]))
+check("默认保留异常读数（keep_abnormal=True）",
+      ls.DEFAULT_KEEP_ABNORMAL is True and g["keep_abnormal"] is True,
+      f"DEFAULT={ls.DEFAULT_KEEP_ABNORMAL} resolved={g['keep_abnormal']}")
+check("显式关闭 keep_abnormal 能被解析成 False",
+      ls._resolve_guard_param({"keep_abnormal": "false"})["keep_abnormal"] is False)
 
 # --------------------------------------------------------------------------- #
 # ⑬ 告警邮件必须真的拿到邮件配置
@@ -1216,16 +1324,24 @@ class _BeginCtx:
     def tasker(self): return self
     def set_background_managed_keys(self, keys): return True
 
-_begin = ls.LaserSweepBegin()
-_begin.run(_BeginCtx(), FakeArg(_base_param, "LaserSweepStart"))
-check("begin 重置了 mail_done_count（否则第二轮完成通知被限额拒绝）",
-      ls._state.get("mail_done_count") == 0, str(ls._state.get("mail_done_count")))
-check("begin 重置了 sent_alerts", ls._state.get("sent_alerts") == 0,
-      str(ls._state.get("sent_alerts")))
-check("begin 重置了 jumps（上一轮的跳变留痕不该跟到这一轮）",
-      ls._state.get("jumps") == [], str(ls._state.get("jumps")))
-check("begin 重置了 sample_failures", ls._state.get("sample_failures") == {},
-      str(ls._state.get("sample_failures")))
+# ⚠️ begin 会通过 _remember_output_root 写 laser_sweep_output.json（真实运行状态文件）。
+#    自检不能把它覆盖成 debug/_check_guard_tmp 这种临时路径 —— 那样跑完自检，
+#    用户点「绘制曲线图 / 打开输出文件夹」就会被带到已删除的临时目录。
+_real_state_file = ls._state_file
+ls._state_file = lambda: _TMP_DIR / "laser_sweep_output.json"
+try:
+    _begin = ls.LaserSweepBegin()
+    _begin.run(_BeginCtx(), FakeArg(_base_param, "LaserSweepStart"))
+    check("begin 重置了 mail_done_count（否则第二轮完成通知被限额拒绝）",
+          ls._state.get("mail_done_count") == 0, str(ls._state.get("mail_done_count")))
+    check("begin 重置了 sent_alerts", ls._state.get("sent_alerts") == 0,
+          str(ls._state.get("sent_alerts")))
+    check("begin 重置了 jumps（上一轮的跳变留痕不该跟到这一轮）",
+          ls._state.get("jumps") == [], str(ls._state.get("jumps")))
+    check("begin 重置了 sample_failures", ls._state.get("sample_failures") == {},
+          str(ls._state.get("sample_failures")))
+finally:
+    ls._state_file = _real_state_file
 
 # --------------------------------------------------------------------------- #
 # ⑮ 安全与退化的三处细节（2026-10-27 审查）

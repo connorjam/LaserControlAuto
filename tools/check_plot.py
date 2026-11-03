@@ -153,6 +153,21 @@ with scratch("parse") as base:
     check("无表头 CSV：按第 2/3 列解析", bare.x_values == [20.0, 21.0] and bare.y_values == [-79.7, -79.6],
           f"{bare.x_values} / {bare.y_values}")
 
+    # 「保留异常读数」写下的行：备注有标记，但数值非空 → 必须参与绘图，不能丢点。
+    kept_csv = base / "kept.csv"
+    write_csv(
+        kept_csv,
+        "序号,设定参数,B软件测量值,时间,备注\n"
+        "1,20,-79.72,2026-10-28 20:00:00,\n"
+        "2,21,-95.3,2026-10-28 20:01:00,连续5次异常，保留读数\n"
+        "3,22,-79.74,2026-10-28 20:02:00,\n",
+    )
+    kept = plot_curve.read_curve_csv(kept_csv)
+    check("异常保留行（备注有标记、数值非空）不会被跳过",
+          kept.skipped == 0 and len(kept.x_values) == 3
+          and kept.y_values[1] == -95.3,
+          f"skipped={kept.skipped} values={kept.y_values}")
+
     # 全是空值 → 必须报可读错误，而不是画一张空图
     empty_csv = base / "empty.csv"
     write_csv(empty_csv, "序号,设定参数,B软件测量值,时间\n1,20,,2026-10-28 20:00:00\n")
@@ -286,13 +301,17 @@ check("没有任何节点被两个 option 同时覆盖", conflicts == {}, str(co
 # --------------------------------------------------------------------------- #
 # ⑤ 任务层：默认 CSV 选择优先级 + 动作真的能产出图片
 #
-# 这一段用桩模块顶掉 maa，直接调 laser_sweep 里的 _resolve_plot_csv /
+# 这一段用桩模块顶掉 maa，直接调 laser_sweep 里的 _resolve_plot_csvs /
 # LaserSweepPlotCurve —— 上面 ①~③ 测的是 plot_curve 模块本身，
-# 这里测的是「任务接线」：会话状态 > 落盘 last_csv > output 里最新 CSV。
+# 这里测的是「任务接线」：
+#   · 一次扫描可能生成一份（正向/反向）或两份（先正后反 / 先反后正）CSV；
+#   · 选择优先级：会话状态 > 落盘 csv_paths/last_csv > output 里最新 CSV；
+#   · 有方向标记时按「基础名 + _正向/_反向」配对，两份都画；
+#   · 一份画失败不影响另一份（任务只在全部失败时返回 False）。
 # --------------------------------------------------------------------------- #
 print()
 print("=" * 78)
-print("⑤ 任务层：默认 CSV 选择与动作执行")
+print("⑤ 任务层：默认 CSV 选择与动作执行（2026-10-30：支持两份）")
 print("=" * 78)
 
 
@@ -351,54 +370,197 @@ _spec.loader.exec_module(ls)
 
 with scratch("task") as base:
     out_root = base / "output"
-    older = out_root / "run1" / "20261027_120000_20_30_11.csv"
-    newer = out_root / "run2" / "20261028_200000_20_30_11.csv"
-    write_csv(older, "序号,设定参数,B软件测量值,时间\n1,20,-79.7,2026-10-27 12:00:00\n")
-    write_csv(newer, "序号,设定参数,B软件测量值,时间\n1,25,-79.6,2026-10-28 20:00:00\n")
-    os.utime(older, (time.time() - 3600, time.time() - 3600))
-    os.utime(newer, (time.time(), time.time()))
+    pair_dir = out_root / "run_pair"
+    fwd = pair_dir / "20261030_200000_20_30_11_正向.csv"
+    rev = pair_dir / "20261030_200000_20_30_11_反向.csv"
+    legacy = out_root / "run_old" / "20261027_120000_20_30_11.csv"
+    write_csv(fwd, "序号,设定参数,B软件测量值,时间\n1,20,-79.72,2026-10-30 20:00:00\n")
+    write_csv(rev, "序号,设定参数,B软件测量值,时间\n1,30,-79.60,2026-10-30 20:01:00\n")
+    write_csv(legacy, "序号,设定参数,B软件测量值,时间\n1,20,-79.70,2026-10-27 12:00:00\n")
+    os.utime(legacy, (time.time() - 7200, time.time() - 7200))
+    os.utime(fwd, (time.time() - 120, time.time() - 120))
+    os.utime(rev, (time.time() - 60, time.time() - 60))
 
-    # 1) 界面显式指定文件
-    picked = ls._resolve_plot_csv({"source_csv": str(older)})
-    check("界面指定 CSV → 用指定的那一份", picked == older, str(picked))
-    # 2) 界面指定目录 → 目录里最新的
-    picked_dir = ls._resolve_plot_csv({"source_csv": str(out_root)})
-    check("界面指定目录 → 自动取目录里最新的 CSV", picked_dir == newer, str(picked_dir))
+    # 1) 界面显式指定文件 → 只画这一份
+    picked = ls._resolve_plot_csvs({"source_csv": str(fwd)})
+    check("界面指定 CSV → 只画指定的那一份", picked == [fwd], str(picked))
+
+    # 2) 界面指定目录 → 目录里最新的 + 同一轮的另一份（按方向标记配对）
+    picked_dir = ls._resolve_plot_csvs({"source_csv": str(out_root)})
+    check("指定目录 → 最新 CSV + 同轮另一份一起画", picked_dir == [fwd, rev], str(picked_dir))
+    check("配对顺序固定为 正向 → 反向（与修改时间无关）",
+          [p.name.endswith("_正向.csv") for p in picked_dir] == [True, False], str(picked_dir))
+
+    # 3) 目录里只有老 CSV（没有方向标记）→ 保持旧行为：只画最新一份
+    picked_legacy = ls._resolve_plot_csvs({"source_csv": str(legacy.parent)})
+    check("没有方向标记的老 CSV → 只画一份（旧行为不变）",
+          picked_legacy == [legacy], str(picked_legacy))
+
+    # 3b) 固定文件名（无时间戳）跨轮重名：不能把不同轮次配成一对
+    fixed_dir = out_root / "fixed_run"
+    fixed_fwd = fixed_dir / "固定_正向.csv"
+    fixed_rev = fixed_dir / "固定_反向.csv"
+    write_csv(fixed_rev, "序号,设定参数,B软件测量值,时间\n1,30,-79.60,2026-10-30 10:00:00\n")
+    write_csv(fixed_fwd, "序号,设定参数,B软件测量值,时间\n1,20,-79.72,2026-10-31 10:00:00\n")
+    os.utime(fixed_rev, (time.time() - 7200, time.time() - 7200))
+    os.utime(fixed_fwd, (time.time() - 7100, time.time() - 7100))
+    picked_fixed = ls._resolve_plot_csvs({"source_csv": str(fixed_dir)})
+    check("固定文件名（无时间戳）不跨轮配对：只画最新一份",
+          picked_fixed == [fixed_fwd], str(picked_fixed))
+
+    # 3c) 单行无表头 CSV：不能按「文本行数-1」误判成 0 行
+    headerless_dir = out_root / "headerless_run"
+    headerless = headerless_dir / "20261031_120000_20_30_1_正向.csv"
+    write_csv(headerless, "20,-79.7\n")
+    os.utime(headerless, (time.time() - 3600, time.time() - 3600))
+    check("单行无表头 CSV 算 1 行数据（不会被误判为只有表头）",
+          ls._csv_data_row_count(headerless) == 1, str(ls._csv_data_row_count(headerless)))
+    check("单行无表头能被认成 1 个可绘制点",
+          ls._csv_plot_point_count(headerless) == 1, str(ls._csv_plot_point_count(headerless)))
+    check("单行无表头不会被 _plot_ready 误删",
+          ls._plot_ready([headerless]) == [headerless], str(ls._plot_ready([headerless])))
+
+    # 3d) 「数据行」与「可绘制点」是两件事：空值占位行算数据、但画不出点
+    mixed = headerless_dir / "mixed.csv"
+    write_csv(
+        mixed,
+        "序号,设定参数,B软件测量值,时间,备注\n"
+        "1,20,,2026-10-31 12:00:00,读数失败\n"
+        "2,30,-79.60,2026-10-31 12:01:00,\n",
+    )
+    os.utime(mixed, (time.time() - 3000, time.time() - 3000))
+    check("空值占位行也算数据记录",
+          ls._csv_data_row_count(mixed) == 2, str(ls._csv_data_row_count(mixed)))
+    check("空值占位行不算可绘制点",
+          ls._csv_plot_point_count(mixed) == 1, str(ls._csv_plot_point_count(mixed)))
 
     saved_csv = ls._state.get("csv_path")
+    saved_paths = ls._state.get("csv_paths")
     real_state_file = ls._state_file
     ls._state_file = lambda: base / "laser_sweep_output.json"
     try:
-        # 3) 会话里刚扫完的优先
-        ls._state["csv_path"] = older
-        picked_session = ls._resolve_plot_csv({})
-        check("本次会话扫描过 → 优先用本次的 CSV", picked_session == older, str(picked_session))
+        # 4) 会话里刚跑完两段 → 两份都画
+        ls._state["csv_path"] = rev
+        ls._state["csv_paths"] = [fwd, rev]
+        picked_session = ls._resolve_plot_csvs({})
+        check("本次会话跑了两段 → 两份 CSV 都画", picked_session == [fwd, rev], str(picked_session))
 
-        # 4) 会话没有 → 读落盘的 last_csv
+        # 5) 会话里只有一份（单方向扫描）→ 一份
+        ls._state["csv_paths"] = [rev]
+        picked_single = ls._resolve_plot_csvs({})
+        check("本次会话只有一份 → 只画这一份", picked_single == [rev], str(picked_single))
+
+        # 5b) 记录里有一份被删了 → 自动跳过，不整体失败
+        ls._state["csv_paths"] = [fwd, base / "missing.csv", rev]
+        picked_missing = ls._resolve_plot_csvs({})
+        check("记录里的 CSV 被删 → 跳过它、剩下的照画",
+              picked_missing == [fwd, rev], str(picked_missing))
+
+        # 5c) 状态文件记录了固定文件名这一轮 → 允许按记录配对
+        ls._state["csv_paths"] = []
         ls._state["csv_path"] = None
-        ls._remember_output_root(out_root, newer)
+        ls._remember_output_root(out_root, csv_path=fixed_rev, csv_paths=[fixed_fwd, fixed_rev])
+        picked_fixed_state = ls._resolve_plot_csvs({})
+        check("状态文件记录了同一轮 → 固定文件名也能配对",
+              picked_fixed_state == [fixed_fwd, fixed_rev], str(picked_fixed_state))
+
+        # 6) 会话清空 → 读落盘记录（csv_paths 优先于 last_csv）
+        ls._state["csv_paths"] = []
+        ls._state["csv_path"] = None
+        ls._remember_output_root(out_root, csv_path=rev, csv_paths=[fwd, rev])
         raw_state = json.loads(ls._state_file().read_text(encoding="utf-8"))
-        check("扫描开始时会记下 last_csv", raw_state.get("last_csv") == str(newer), str(raw_state))
-        picked_last = ls._resolve_plot_csv({})
-        check("没有会话状态 → 用上次扫描记录（last_csv）", picked_last == newer, str(picked_last))
+        check("扫描开始时会记下 last_csv（兼容老读取方）",
+              raw_state.get("last_csv") == str(rev), str(raw_state))
+        check("扫描开始时会记下 csv_paths（两份）",
+              raw_state.get("csv_paths") == [str(fwd), str(rev)], str(raw_state.get("csv_paths")))
+        picked_last = ls._resolve_plot_csvs({})
+        check("没有会话状态 → 用上次扫描记录的两份", picked_last == [fwd, rev], str(picked_last))
 
-        # 5) 记录的文件没了 → 退回 output 里最新的
-        newer.unlink()
-        picked_fallback = ls._resolve_plot_csv({})
-        check("记录的 CSV 不存在 → 退回 output 里最新的 CSV", picked_fallback == older, str(picked_fallback))
+        # 7) 老状态文件只有 last_csv → 兼容成一份
+        ls._remember_output_root(out_root, legacy)
+        check("老状态文件（只有 last_csv）→ 只画一份",
+              ls._resolve_plot_csvs({}) == [legacy], str(ls._resolve_plot_csvs({})))
 
-        # 6) 动作真的能跑通（open_when_done=false，避免自检弹窗）
+        # 8) 记录的文件全没了 → 退回 output 里最新的 CSV，并按标记配成一对
+        ls._remember_output_root(out_root, csv_path=base / "gone.csv", csv_paths=[base / "gone.csv"])
+        picked_fallback = ls._resolve_plot_csvs({})
+        check("记录的文件不存在 → 退回 output 里最新的一对",
+              picked_fallback == [fwd, rev], str(picked_fallback))
+
+        # 9) 动作真的能跑通：两份 CSV 各出一张图（open_when_done=false，避免自检弹窗）
+        ls._state["csv_path"] = rev
+        ls._state["csv_paths"] = [fwd, rev]
+
         class _Arg:
-            custom_action_param = {"source_csv": "", "image_name": "", "open_when_done": False}
             node_name = "LaserSweepPlotCurve"
 
+            def __init__(self, image_name="", source_csv=""):
+                self.custom_action_param = {
+                    "source_csv": source_csv,
+                    "image_name": image_name,
+                    "open_when_done": False,
+                }
+
         ok = ls.LaserSweepPlotCurve().run(None, _Arg())
-        image = plot_curve.default_image_path(older)
+        fwd_image = plot_curve.default_image_path(fwd)
+        rev_image = plot_curve.default_image_path(rev)
         check("LaserSweepPlotCurve 动作返回成功", ok is True, str(ok))
-        check("动作产出的图片落在 CSV 同级目录", image.is_file(), str(image))
+        check("正向 CSV 的图片落在 CSV 同级目录", fwd_image.is_file(), str(fwd_image))
+        check("反向 CSV 的图片也画出来了", rev_image.is_file(), str(rev_image))
+        check("两张图文件名不同（不会互相覆盖）", fwd_image != rev_image)
+
+        # 10) 一份 CSV 坏了（只有表头）→ 自动跳过它，另一份照画、任务仍算成功
+        broken = pair_dir / "broken.csv"
+        write_csv(broken, "序号,设定参数,B软件测量值,时间\n")
+        ls._state["csv_paths"] = [fwd, broken]
+        picked_ready = ls._resolve_plot_csvs({})
+        check("只有表头的 CSV 会被自动跳过（不去画空图）",
+              picked_ready == [fwd], str(picked_ready))
+        ok_broken = ls.LaserSweepPlotCurve().run(None, _Arg())
+        check("一份 CSV 没有数据 → 另一份照画、任务不整体失败",
+              ok_broken is True, str(ok_broken))
+
+        # 10b) 全都是空 CSV → 原样返回，让动作打出明确报错（而不是静默返回空）
+        ls._state["csv_paths"] = [broken]
+        picked_all_empty = ls._resolve_plot_csvs({})
+        check("全都只有表头时原样返回（交给动作报明确错误）",
+              picked_all_empty == [broken], str(picked_all_empty))
+        ok_all_empty = ls.LaserSweepPlotCurve().run(None, _Arg())
+        check("全部 CSV 都没数据 → 任务返回失败", ok_all_empty is False, str(ok_all_empty))
+        broken.unlink()
+
+        # 10c) GBK 编码的 CSV：数行 / 选择 / 绘制都不能崩（2026-10-30 审查发现）
+        #      现场/Excel 导出的 CSV 可能是 GBK；_csv_data_row_count 若只按 utf-8 读会抛
+        #      UnicodeDecodeError，导致「填目录/自动选」在选文件阶段直接崩掉。
+        gbk_dir = out_root / "run_gbk"
+        gbk_csv = gbk_dir / "20261031_100000_20_30_2_正向.csv"
+        gbk_dir.mkdir(parents=True, exist_ok=True)
+        gbk_csv.write_bytes(
+            (
+                "序号,设定参数,B软件测量值,时间,备注\n"
+                "1,20,-79.70,2026-10-31 10:00:00,\n"
+                "2,30,-79.60,2026-10-31 10:01:00,\n"
+            ).encode("gbk")
+        )
+        check("GBK 编码的 CSV 能数出数据行数（不抛 UnicodeDecodeError）",
+              ls._csv_data_row_count(gbk_csv) == 2, str(ls._csv_data_row_count(gbk_csv)))
+        picked_gbk = ls._resolve_plot_csvs({"source_csv": str(gbk_dir)})
+        check("GBK CSV 目录选择不会崩", picked_gbk == [gbk_csv], str(picked_gbk))
+        ok_gbk = ls.LaserSweepPlotCurve().run(None, _Arg(source_csv=str(gbk_dir)))
+        check("GBK CSV 能正常绘制成图",
+              ok_gbk is True and plot_curve.default_image_path(gbk_csv).is_file(),
+              f"ok={ok_gbk}")
+
+        # 11) 单份 + 界面填了图片名 → 用界面的名字（且仍强制同目录）
+        ls._state["csv_paths"] = [fwd]
+        ok_custom = ls.LaserSweepPlotCurve().run(None, _Arg(image_name="自定义图.png"))
+        custom_image = fwd.parent / "自定义图.png"
+        check("单份时界面图片名生效", ok_custom is True and custom_image.is_file(),
+              str(custom_image))
     finally:
         ls._state_file = real_state_file
         ls._state["csv_path"] = saved_csv
+        ls._state["csv_paths"] = saved_paths
 
 print()
 print("=" * 78)

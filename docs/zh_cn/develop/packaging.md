@@ -141,7 +141,8 @@ python tools\fetch_binaries.py
 - `MAA-win-x86_64-*.zip` → `deps/`（要能看到 `deps/bin` 和 `deps/share/MaaAgentBinary`）
 - `MFAAvalonia-*-win-x64.zip` → `MFA/`
 
-> 想锁定版本：`python tools\fetch_binaries.py --maa-tag v5.13.1 --mfa-tag v2.16.1`
+> 如果是锁定版本（推荐，tag 构建才可复现）：
+> `python tools\fetch_binaries.py --maa-tag v5.15.0 --mfa-tag v2.16.4`
 >
 > 脚本会校验下载完整性（大小 + zip 结构）。网络断了会保留 `.part` 文件，
 > **重跑即从断点续传**，不会白下。
@@ -165,7 +166,7 @@ python tools\prepare_embedded_python.py
 ```powershell
 mkdir install -Force
 Copy-Item -Recurse -Force MFA\* install\
-python tools\install.py v1.0.1 win x86_64
+python tools\install.py v1.1.0 win x86_64
 ```
 
 跑完 `install/` 就是成品。日志里会出现：
@@ -194,7 +195,8 @@ python tools\pack_zip.py
 
 zip **不带 `install/` 前缀**，用户解压出来第一层就是 `MFAAvalonia.exe`；
 `config/`、`logs/`、`debug/`、`temp/` 这些运行时目录会被自动排除，
-所以不会把本机的窗口标题、任务勾选状态、日志一起发出去。
+根目录的 `appsettings.json` 和 `resource/mfa_layout.json` 也不会带 ——
+这两份是 MFA 在本机生成的界面状态，带上会把「公告已读」「窗口布局」发给新用户。
 
 > 想手动压也可以（把 `install/` 里的东西压成 zip 就行），
 > 只是记得别把 `config/`、`logs/`、`debug/`、`temp/` 带进去。
@@ -258,11 +260,10 @@ Protocol version mismatch client: ["v5.12.2"] [kProtocolVersion=7]
 两者都用「最新版」时通常没问题；要锁版本就两边一起锁：
 
 ```powershell
-# 锁定 maafw 版本
-python tools\prepare_embedded_python.py
-deps\python\python.exe -m pip install "maafw==5.13.1"
+# 锁定 maafw 版本：把对应 wheel 放进 deps\wheels 缓存，再重跑 prepare 脚本
+python tools\prepare_embedded_python.py 3.13.7
 
-# 对应地把 CI 里的 MAAFW_VERSION 也设成 v5.13.1
+# 对应地把 CI 里的 MAAFW_VERSION 也设成 v5.15.0
 ```
 
 ---
@@ -352,12 +353,13 @@ Newtonsoft.Json.JsonSerializationException: welcome announcement entries must be
 **原因**：`welcome` 被写成了字符串数组。
 
 ```jsonc
-"welcome": ["第一条公告", "第二条公告"]   // ❌ MFAAvalonia v2.16.1 直接报错
+"welcome": ["第一条公告", "第二条公告"]   // ❌ MFAAvalonia v2.16.3 之前会直接报错
 ```
 
 ProjectInterface V2 协议从 v2.10.2 起确实允许数组写法，`tools/validate_schema.py`
-的 schema 校验也放行（schema 里 `welcome` 就是 `string | string[]`），
-但 MFAAvalonia v2.16.1 的 `MaaWelcomeConverter` 只认两种：
+的 schema 校验也放行（schema 里 `welcome` 就是 `string | string[]`）。
+MFAAvalonia v2.16.3 起已经支持字符串数组；但在更老的 v2.16.1 里，
+`MaaWelcomeConverter` 只认两种：
 
 - 一个字符串：`"welcome": "公告正文"`
 - 对象数组：`"welcome": [{"label": "标题", "content": "正文"}]`

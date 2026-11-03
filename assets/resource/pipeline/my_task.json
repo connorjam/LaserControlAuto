@@ -3,6 +3,7 @@
     //  激光控制自动化 —— 参数扫描主流程
     //
     //  做什么：
+    //    0. 先读「扫描方向」（正向 / 反向 / 先正后反 / 先反后正，见下面 ⓪）
     //    1. 在 A 软件（Low_Noise_Drive_Debugger_V2.13.exe）里设置一个参数
     //       ① OCR 找到 "Temperature" 这个词
     //       ② 点它右边的输入框，填数值
@@ -12,6 +13,13 @@
     //    4. 把「设定参数 + 测量值」追加写入 CSV
     //    5. 等待本次操作完毕，换下一个参数，回到第 1 步
     //       参数区间 20 ~ 30，步长 1，共 11 组
+    //
+    //  ── 扫描方向（2026-10-30 新增，见下面 ⓪ 那个节点）──────────────────
+    //    正向 = 从小到大（20, 21, ... 30）；反向 = 从大到小（30, 29, ... 20）。
+    //    选「先正后反 / 先反后正」时同一个任务会连续跑两段，每段各生成一份 CSV，
+    //    文件名带 _正向 / _反向 标记（同一轮两段共用基础名，只有方向标记不同）。
+    //    「绘制曲线图」任务会把这个标记识别成正/反一对，把两张图都画出来。
+    //  ───────────────────────────────────────────────────────────────────
     //
     //  自定义动作 / 识别实现在  agent/laser_sweep.py
     //
@@ -57,7 +65,8 @@
     //    绝对差 > tolerance_abs(默认 3.0) **且** 相对差 > tolerance_pct(默认 1%) 才判异常
     //    （任一在容差内就算正常，取更宽松的那个，避免误杀真实跳变）
     //    → 等 retry_wait(默认 3 秒) 重读同一个点，最多 retry_max(默认 5) 次；
-    //    5 次都不可信：把这一组写成空值占位 + 发一封告警邮件，
+    //    5 次都不可信：发一封告警邮件，并按 keep_abnormal(默认 true) 决定
+    //    这一组**保留最后一次异常读数**（默认，曲线不缺这个点）还是写空值占位；
     //    然后按 continue_on_abnormal(默认 true) 决定**继续扫下一个点**还是终止扫描
     //    （默认继续 —— 没人盯着的时候，让它跑完比停在半路更实用）。
     //    · 正常读数：零额外开销（只多一次比较 + 一次跳转改写，实测 0.016 毫秒）
@@ -92,6 +101,33 @@
     //      · B 软件 GaussianBeam  → 客户区 1440x829，"Wavelength" 的数值是 "1061 nm"
     // ==========================================================================
 
+    // ---------- ⓪ 扫描方向：正向 / 反向 / 先正后反 / 先反后正 ----------
+    //
+    // 为什么单独一个节点，而不是把 direction 塞进 LaserSweepStart：
+    //   界面上「扫描方向」是 select 选项，它只能靠**选中项自己的
+    //   pipeline_override** 传值，而 pipeline_override 对节点的
+    //   custom_action_param 是整体替换 —— 如果让方向选项也去覆盖
+    //   LaserSweepStart，就会把起始值/步长/输出目录那一整块参数顶掉
+    //   （2026-10-27 踩过同样的坑）。所以让方向单独占一个节点：
+    //   它是任务入口，先于 begin 运行，把方向存进 _state 供 begin 取用。
+    //
+    // ⚠️ 本节点的 custom_action_param 必须与 interface.json「扫描方向」
+    //    每个 case 的 pipeline_override 字段一致（都是 {"direction": ...}）。
+    "LaserSweepDirection": {
+        "recognition": "DirectHit",
+        "action": "Custom",
+        "custom_action": "laser_sweep_direction",
+        "custom_action_param": {
+            // forward / reverse / forward_reverse / reverse_forward
+            // 也认 正向/反向/先正后反/先反后正 等写法（见 agent 的别名表）
+            "direction": "forward"
+        },
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": ["LaserSweepStart"]
+    },
+
     // ---------- ① 初始化：生成参数序列 + 建 CSV 表头 ----------
     "LaserSweepStart": {
         "recognition": "DirectHit",
@@ -118,7 +154,9 @@
             //                  认 strftime（%Y%m%d 等）与 {date}/{time}/{datetime} 别名；
             //                  留空 = 用默认时间名。填绝对路径 = 直接当总目录（兼容老配置）。
             //   csv_name       结果文件名。留空 = 自动用「时间_起始值_终止值_总点数」，
-            //                  如 20261016_143435_20_30_11（不写 .csv 会自动补）
+            //                  如 20261016_143435_20_30_11（不写 .csv 会自动补）。
+            //                  2026-10-30 起，文件名末尾会再加「_正向 / _反向」标记，
+            //                  两段方向（先正后反 / 先反后正）因此各有一份互不覆盖的 CSV。
             //   output_root    总目录名，默认 output（相对 interface.json 所在目录）
             //   open_when_done 跑完是否自动打开 output 文件夹，默认 true
             // 想整个换地方，就把 output_root 填绝对路径，如 "D:\\扫描数据"。
@@ -595,11 +633,15 @@
             // 主人的原话：异常出现了邮件发给我，但我未必有时间处理，
             // 最合适的是让它继续测试 —— 别因为一个点把整轮扫描停在半路。
             //
-            // true  ：发告警邮件 → 当前这组写空值占位 → 继续扫下一个点
+            // true  ：发告警邮件 → 当前这组按 keep_abnormal 处理 → 继续扫下一个点
             // false ：发告警邮件 → 走 stop_node 终止整个扫描（旧行为）
             //
             // 两种都会发信，区别只在要不要停下。界面上可以随时切。
-            "continue_on_abnormal": true
+            "continue_on_abnormal": true,
+            // ===== 判废的这一组要不要保留最后读数（2026-10-29 新增）=====
+            // true（默认）：CSV 写最后一次异常值 + 备注「保留读数」，画图曲线不会缺点。
+            // false       ：写空值占位（旧行为），事后一眼能看出这组废了。
+            "keep_abnormal": true
         },
         "rate_limit": 0,
         "pre_delay": 0,
@@ -636,7 +678,7 @@
         "next": ["LaserSweepReadValueB"]
     },
 
-    // ---------- ⑫ 连续重测仍不可信：写空值占位 + 告警 + 终止 ----------
+    // ---------- ⑫ 连续重测仍不可信：落一行结果 + 告警 + 终止 ----------
     // 为什么没有 next：
     //   走到这里说明设备/软件已经不可信了，继续扫下去只会往 CSV 里灌垃圾数据，
     //   所以这里**故意不留出口** —— 节点执行完流程就结束（正常返回也算跑完，
@@ -644,10 +686,10 @@
     //   和 LaserSweepAbort（出错中止）、LaserSweepDone（跑完收尾）是三种不同的收尾。
     //
     // 它做的三件事：
-    //   ① 把当前这一组写成**空值占位**（和 LaserSweepRecordFailed 同一个写法：
-    //      序号、设定参数、空测量值、时间都写进去）—— 保证 CSV 行数和扫描点数
-    //      对得上，事后一眼就能看出"第 7 组空着 = 那组读数出问题了"，
-    //      而不是行错了位、把后面的值全对应错；
+    //   ① 给当前这一组落一行（序号、设定参数、测量值、时间都写进去）——
+    //      默认按 keep_abnormal=true 保留最后一次异常读数，备注列标记「保留读数」，
+    //      曲线不会缺点；关掉后写空值占位（旧行为）。两种都保证 CSV 行数和
+    //      扫描点数对得上，事后一眼能看出第几组出过问题；
     //   ② 按 Guard 传下来的配置发告警邮件（配了的话）；
     //   ③ 打印原因（哪个参数点、连续几次异常、各自读到什么）并结束流程。
     // 耗时：写一行 CSV + 发一封信，正常几十毫秒，网络慢时受 timeout_sec 上限保护。
@@ -659,7 +701,9 @@
             // 连续几次不可信才停到这里 —— 只是给日志/邮件用的说明文字，
             // 真正的计数在 agent 的 laser_sweep_guard 里维护。
             // 界面上的「重测次数」会通过 pipeline_override 覆盖它。
-            "retry_max": 5
+            "retry_max": 5,
+            // 是否保留最后读数（界面「保留异常读数」会覆盖它）
+            "keep_abnormal": true
         },
         "rate_limit": 0,
         "pre_delay": 0,
@@ -680,6 +724,11 @@
         "recognition": "DirectHit",
         "action": "Custom",
         "custom_action": "laser_sweep_record_failed",
+        "custom_action_param": {
+            // 本组之前读到过数时是否保留它（默认保留，避免曲线缺点）。
+            // 本组一个数都没读到时没有值可保留，仍写空值。
+            "keep_abnormal": true
+        },
         "rate_limit": 0,
         "pre_delay": 0,
         "post_delay": 0,
@@ -705,6 +754,9 @@
     },
 
     // ---------- ⑮ 换下一个参数；跑完 11 组就收尾 ----------
+    // 2026-10-30 起：如果是「先正后反 / 先反后正」，本节点在跑完当前段后
+    // 会先切到下一段（新建它的 CSV、组号回到 1），仍然回到 ApplyParam 继续；
+    // 只有两段都跑完（或下一段文件建不出来）才改道 LaserSweepDone。
     "LaserSweepAdvance": {
         "recognition": "DirectHit",
         "action": "Custom",
@@ -763,9 +815,12 @@
     //   ② 只要 CSV 还在，随时可以重画（不用重跑一两小时的扫描）；
     //   ③ 绘图失败也绝不能影响扫描 —— 这里是单独的入口节点。
     //
-    // 默认画哪一份：「最近导出的单个 CSV」。优先级见 agent 的 _resolve_plot_csv：
-    //   本次会话扫描过 → laser_sweep_output.json 里的 last_csv → output 里最新的 CSV。
-    // 用户也可以在「绘图设置」里填具体 CSV（或目录，自动取目录里最新的）。
+    // 默认画哪些 CSV：「最近那一轮导出的 CSV」。优先级见 agent 的 _resolve_plot_csvs：
+    //   本次会话扫描过 → laser_sweep_output.json 里的 csv_paths/last_csv →
+    //   output 里最新的 CSV，并按 _正向/_反向 标记配成一对。
+    //   两段方向（先正后反 / 先反后正）生成的两份 CSV 会各画一张图；
+    //   只有表头、还没有数据行的 CSV 会被跳过。
+    // 用户也可以在「绘图设置」里填具体 CSV（只画这一份），或填目录（自动取目录最新的一份）。
     //
     // ⚠️ custom_action_param 的字段必须与 interface.json「绘图设置」里的
     //    pipeline_override 完全一致 —— override 是整体替换，少一个就丢一个。
@@ -774,7 +829,7 @@
         "action": "Custom",
         "custom_action": "laser_sweep_plot_curve",
         "custom_action_param": {
-            // 留空 = 自动选择最近导出的单个 CSV
+            // 留空 = 自动选择最近那一轮的 CSV（一份或两份）
             "source_csv": "",
             // 留空 = <CSV 文件名>_曲线.png（永远和 CSV 同目录）
             "image_name": "",

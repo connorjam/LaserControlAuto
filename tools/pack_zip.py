@@ -32,6 +32,13 @@ dist_path = working_dir / "dist"
 # （config 里会存用户的窗口标题、任务勾选状态；logs/debug 是日志；output 是扫描结果）
 EXCLUDE_DIRS = {"config", "logs", "debug", "temp", "backup", "output"}
 
+# 运行时自己生成的单文件，同样不进分发包：
+#   appsettings.json          —— MFA 的本地状态（公告已读、实例顺序、定时器等）
+#   resource/mfa_layout.json  —— MFA 的界面布局（本机拖拽后的卡片位置）
+# 这两个文件不带时 MFA 会用默认值生成；带上反而会把开发机的状态发给用户，
+# 比如 DoNotShowAgain=True 会让新用户看不到欢迎公告。
+EXCLUDE_FILES = {"appsettings.json", "resource/mfa_layout.json"}
+
 # 这些前缀的目录也是运行时产物（比如用户导出的 log_20260922_100738）
 EXCLUDE_PREFIXES = ("log_",)
 
@@ -40,6 +47,8 @@ EXCLUDE_ANY = {"__pycache__"}
 
 
 def should_skip(relative: Path) -> bool:
+    if relative.as_posix() in EXCLUDE_FILES:
+        return True
     parts = relative.parts
     if any(part in EXCLUDE_ANY for part in parts):
         return True

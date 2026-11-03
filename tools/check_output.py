@@ -270,6 +270,74 @@ with scratch("paths") as tmp:
     check("默认名可复现（同一秒内一致）",
           ls._resolve_output_paths(dict(base))[0].parent.name == a.parent.name)
 
+    print()
+    print("=" * 78)
+    print("⑤b 扫描方向：文件名标记 + 两段共用基础名（2026-10-30 新增）")
+    print("=" * 78)
+    fwd, root_fwd = ls._resolve_output_paths(
+        dict(base), start=20.0, end=30.0, total=11, direction="forward"
+    )
+    rev, root_rev = ls._resolve_output_paths(
+        dict(base), start=20.0, end=30.0, total=11, direction="reverse"
+    )
+    check("正向文件名以 _正向.csv 结尾", fwd.name.endswith("_正向.csv"), fwd.name)
+    check("反向文件名以 _反向.csv 结尾", rev.name.endswith("_反向.csv"), rev.name)
+    check("正反两份同目录、同基础名（只差方向标记）",
+          fwd.parent == rev.parent and root_fwd == root_rev
+          and fwd.name.replace("_正向", "") == rev.name.replace("_反向", ""),
+          f"{fwd.name} / {rev.name}")
+
+    # begin 会先算一次 base_name，再分别传给两段 —— 这样两份 CSV 的时间戳一致
+    base_name = ls._resolve_csv_base_name(dict(base), start=20.0, end=30.0, total=11)
+    check("基础名仍是「时间_起始_终止_点数」（不含方向标记）",
+          re.fullmatch(r"\d{8}_\d{6}_20_30_11", base_name) is not None, base_name)
+    pair_fwd, _ = ls._resolve_output_paths(dict(base), direction="forward", base_name=base_name)
+    pair_rev, _ = ls._resolve_output_paths(dict(base), direction="reverse", base_name=base_name)
+    check("两段共用基础名 → 文件名只差 _正向 / _反向",
+          pair_fwd.name == base_name + "_正向.csv"
+          and pair_rev.name == base_name + "_反向.csv",
+          f"{pair_fwd.name} / {pair_rev.name}")
+
+    # 自定义文件名：标记要插在 .csv 之前，而不是变成 xxx.csv_正向
+    custom_base = ls._resolve_csv_base_name({**base, "csv_name": "我的结果.csv"})
+    custom_fwd, _ = ls._resolve_output_paths(
+        {**base, "csv_name": "我的结果.csv"}, direction="forward", base_name=custom_base
+    )
+    check("自定义文件名：标记插在扩展名之前",
+          custom_fwd.name == "我的结果_正向.csv", custom_fwd.name)
+    check("自定义名本来已带标记 → 不重复叠加",
+          ls._resolve_output_paths({**base, "csv_name": "结果_正向.csv"}, direction="forward")[0].name
+          == "结果_正向.csv")
+
+    # 结果文件夹名里的时间占位符只能展开一次：两段必须落在同一个文件夹
+    # （否则第二段开始时间晚几分钟，{time} 就变成另一个目录了）
+    run_name = ls._resolve_run_name({"csv_dir": "固定文件夹"})
+    check("结果文件夹名可指定", run_name == "固定文件夹", run_name)
+    check("结果文件夹名留空 → 系统时间_output",
+          re.fullmatch(r"\d{8}_\d{6}_output", ls._resolve_run_name({})) is not None,
+          ls._resolve_run_name({}))
+    time_run = ls._resolve_run_name({"csv_dir": "扫描_%Y%m%d"})
+    check("结果文件夹名支持时间占位符",
+          time_run == "扫描_" + datetime.now().strftime("%Y%m%d"), time_run)
+    same_fwd, _ = ls._resolve_output_paths(
+        dict(base), direction="forward", base_name=base_name, run_name="同一轮"
+    )
+    same_rev, _ = ls._resolve_output_paths(
+        dict(base), direction="reverse", base_name=base_name, run_name="同一轮"
+    )
+    check("两段传同一个 run_name → 落在同一个文件夹",
+          same_fwd.parent == same_rev.parent and same_fwd.parent.name == "同一轮",
+          f"{same_fwd.parent} / {same_rev.parent}")
+
+    # 老写法 csv_path：带方向时也要加标记，否则两段会写同一个文件
+    legacy_file = tmp / "很老" / "旧结果.csv"
+    legacy_fwd, _ = ls._resolve_output_paths({"csv_path": str(legacy_file)}, direction="forward")
+    check("旧 csv_path + 方向 → 仍加标记（两段不互相覆盖）",
+          legacy_fwd.name == "旧结果_正向.csv" and legacy_fwd.parent == legacy_file.parent,
+          str(legacy_fwd))
+    check("旧 csv_path 不带方向 → 保持原路径（老行为不变）",
+          ls._resolve_output_paths({"csv_path": str(legacy_file)})[0] == legacy_file)
+
 print()
 print("=" * 78)
 print("⑥ 「打开输出文件夹」的取值优先级")
@@ -300,6 +368,25 @@ with scratch("state") as tmp2:
         check("记录也没有时读回 None", ls._recall_output_root() is None)
         fallback_root = ls._resolve_output_paths({})[1]
         check("兜底目录名是 output", fallback_root.name == "output", str(fallback_root))
+
+        # 5) 两段扫描：csv_paths 列表落盘，last_csv 仍指向最后一份（老读取方兼容）
+        first = tmp2 / "run" / "结果_正向.csv"
+        second = tmp2 / "run" / "结果_反向.csv"
+        ls._remember_output_root(tmp2 / "落盘目录", csv_path=first, csv_paths=[first, second])
+        raw = json.loads(ls._state_file().read_text(encoding="utf-8"))
+        check("两段扫描把两份 CSV 都记进 csv_paths",
+              raw.get("csv_paths") == [str(first), str(second)], str(raw.get("csv_paths")))
+        check("last_csv 仍是最后一份（老读取方不受影响）",
+              raw.get("last_csv") == str(second), str(raw.get("last_csv")))
+        check("_recall_csv_paths 能读回两份",
+              ls._recall_csv_paths() == [first, second], str(ls._recall_csv_paths()))
+        # 6) 老状态文件只有 last_csv → 兼容成一份
+        ls._state_file().write_text(
+            json.dumps({"output_root": str(tmp2 / "老格式"), "last_csv": str(first)}),
+            encoding="utf-8",
+        )
+        check("老状态文件（只有 last_csv）兼容成一份",
+              ls._recall_csv_paths() == [first], str(ls._recall_csv_paths()))
     finally:
         ls._state_file = real_state_file
         ls._state["out_root"] = saved

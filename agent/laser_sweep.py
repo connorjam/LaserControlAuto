@@ -3,7 +3,11 @@
 对应流水线：assets/resource/pipeline/my_task.json 里的 LaserSweep* 节点。
 
 流程：
-    laser_sweep_begin        生成参数序列（20, 21, ... 30）并建好 CSV 表头
+    laser_sweep_direction    读取界面选的「扫描方向」（正向 / 反向 / 先正后反 / 先反后正），
+                             存进 _state 供 laser_sweep_begin 使用
+    laser_sweep_begin        生成参数序列（正向 20, 21, ... 30；反向 30, 29, ... 20）并建好 CSV 表头
+                             · 单方向：一份 CSV（文件名带 _正向 / _反向 标记）
+                             · 先正后反 / 先反后正：两段连续扫，各自一份 CSV，一次任务出两份结果
     laser_sweep_apply_param  把本轮参数值注入输入框节点的 input_text
     （点击 / 全选 / 输入 / 点 Setting 由流水线节点完成，不在本文件里）
     laser_find_nearest_setting  找出离 "Temperature" 最近的 "Setting" 并交给 Click
@@ -19,12 +23,13 @@
                                后续只认那一小块），最后取**平均数**写进 CSV
                                （见 DEFAULT_SAMPLE_WINDOW_SEC 那一段）
     laser_sweep_guard        读数校验（2026-10-26 新增）：把这次读到的值和上一次比，
-                             差得离谱就等几秒重读；连续 5 次都不正常则终止扫描
+                             差得离谱就等几秒重读；连续 5 次都不正常则按「保留异常读数」
+                             处理这一组，再按「异常后继续测试」决定继续扫还是停止
     laser_sweep_retry_value  重测等待节点（流水线里的普通节点，只有 post_delay，
                              由 laser_sweep_guard 现改；本文件没有对应代码）
-    laser_sweep_abnormal_stop  连续异常到顶：写空值占位、打印摘要、停止整个任务
+    laser_sweep_abnormal_stop  连续异常到顶：按「保留异常读数」落一行（默认保留最后读数）、打印摘要、停止整个任务
     laser_sweep_record       把「序号, 设定值, 测量值, 时间」追加进 CSV
-    laser_sweep_record_failed   识别失败时写入空值占位，保证行数对齐
+    laser_sweep_record_failed   识别失败时按设置保留本组上次读数或写空值占位，保证行数对齐
     laser_sweep_advance      推进到下一个参数，跑完则跳去收尾节点
     laser_sweep_finish       打印结果文件路径，收尾
     laser_sweep_plot_curve   独立任务：把导出的 CSV 画成曲线图（实现在 plot_curve.py）
@@ -148,12 +153,18 @@ DEFAULT_TOLERANCE_PCT = 1.0
 DEFAULT_RETRY_WAIT = 3.0
 DEFAULT_RETRY_MAX = 5
 # 连续异常到顶之后怎么办（2026-10-27 新增开关，默认「继续测试」）：
-#   True  = 发完告警邮件、记空值占位，然后**继续扫下一个点**。
+#   True  = 发完告警邮件、按 keep_abnormal 处理这一组，然后**继续扫下一个点**。
 #           主人原话：异常出现了邮件发给我，但我未必有时间处理，
 #           最合适的是让它继续跑完，别因为一个点把整轮扫描停在半路。
 #   False = 老行为：终止整个扫描。
 # 注意两种都会发邮件（只要「读数异常发送邮件」开着），区别只在要不要停。
 DEFAULT_CONTINUE_ON_ABNORMAL = True
+# 连续异常判废时，CSV 里要不要**保留最后一次异常读数**（2026-10-29 新增）。
+#   True（默认）= 保留：这一组仍写最后读到的数值，备注列标「保留读数」。
+#                  这样曲线不会因为个别异常点变成空白，画图时不会缺点。
+#   False        = 老行为：写空值占位，事后一眼能看出这组废了。
+# 注意：读数彻底失败、一个数都没读到时没有可保留的值，仍然写空值。
+DEFAULT_KEEP_ABNORMAL = True
 # ── 「真实跳变」的内部一致性容差（2026-10-27 审查建议分开）──────────────
 #
 # 为什么不复用 tolerance_abs / tolerance_pct：
@@ -167,6 +178,92 @@ DEFAULT_JUMP_ABS_TOL = 0.3
 DEFAULT_JUMP_PCT_TOL = 0.5
 DEFAULT_RETRY_NODE = "LaserSweepRetryValue"
 DEFAULT_ADVANCE_NODE = "LaserSweepAdvance"
+
+# ── 扫描方向（2026-10-30 新增）──────────────────────────────────────────────
+# 界面上「扫描方向」是一个下拉框（PI V2 的 select 类型），四个选项：
+#
+#     正向       = 参数从小到大（20, 21, ... 30），就是本程序一直以来的行为
+#     反向       = 参数从大到小（30, 29, ... 20）
+#     先正后反   = 先扫正向，跑完生成一份 CSV；再扫反向，生成另一份 CSV
+#     先反后正   = 反过来
+#
+# 方向值怎么进到 agent：
+#   select 的选项只能通过「选项自己的 pipeline_override」传值，而 pipeline_override
+#   对节点的 custom_action_param 是**整体替换**。如果让方向选项也去覆盖
+#   LaserSweepStart，就会把起始值/步长/输出目录那一整块参数顶掉（2026-10-27
+#   就踩过这个坑）。所以单独安排一个 LaserSweepDirection 节点承载方向：
+#   它是任务的入口，先于 begin 运行，把解析好的方向存进 _state["pending_direction"]，
+#   begin 再取用。begin 自己也会从节点参数 / 框架 pipeline 里兜底读一次。
+DIRECTION_FORWARD = "forward"
+DIRECTION_REVERSE = "reverse"
+DIRECTION_FORWARD_REVERSE = "forward_reverse"
+DIRECTION_REVERSE_FORWARD = "reverse_forward"
+DEFAULT_DIRECTION = DIRECTION_FORWARD
+DIRECTION_NODE = "LaserSweepDirection"
+
+# 方向代码 → 中文名。CSV 文件名里的正反标记就用这里的短名（_正向 / _反向），
+# 这样「同一轮的两份 CSV」只差一个标记，肉眼和脚本都容易配对。
+DIRECTION_LABELS = {
+    DIRECTION_FORWARD: "正向",
+    DIRECTION_REVERSE: "反向",
+    DIRECTION_FORWARD_REVERSE: "先正后反",
+    DIRECTION_REVERSE_FORWARD: "先反后正",
+}
+# 单段方向的说明，日志和 UI 文案共用一套说法
+DIRECTION_HINTS = {
+    DIRECTION_FORWARD: "从小到大",
+    DIRECTION_REVERSE: "从大到小",
+}
+# 一个方向跑几段、每段是哪种方向（两段方向的顺序就是实际执行顺序）
+DIRECTION_PHASES = {
+    DIRECTION_FORWARD: (DIRECTION_FORWARD,),
+    DIRECTION_REVERSE: (DIRECTION_REVERSE,),
+    DIRECTION_FORWARD_REVERSE: (DIRECTION_FORWARD, DIRECTION_REVERSE),
+    DIRECTION_REVERSE_FORWARD: (DIRECTION_REVERSE, DIRECTION_FORWARD),
+}
+
+
+def _build_direction_aliases() -> dict[str, str]:
+    """拼出「用户可能填的方向写法 → 标准代码」的别名表。
+
+    为什么容忍这么多写法：方向既可能来自下拉框（写标准代码），也可能被
+    手改配置文件/老 preset 写成中文或英文。认不出来就**静默按正向跑**是最
+    危险的失败方式（提示说反向、实际正向），所以能认的都认掉，认不出的
+    明确打日志告警。
+    """
+    table: dict[str, str] = {}
+    for code, label in DIRECTION_LABELS.items():
+        table[code] = code
+        table[code.replace("_", "")] = code
+        table[label] = code
+    table.update(
+        {
+            "正向扫描": DIRECTION_FORWARD,
+            "正": DIRECTION_FORWARD,
+            "从小到大": DIRECTION_FORWARD,
+            "升序": DIRECTION_FORWARD,
+            "asc": DIRECTION_FORWARD,
+            "ascending": DIRECTION_FORWARD,
+            "up": DIRECTION_FORWARD,
+            "反向扫描": DIRECTION_REVERSE,
+            "反": DIRECTION_REVERSE,
+            "从大到小": DIRECTION_REVERSE,
+            "降序": DIRECTION_REVERSE,
+            "desc": DIRECTION_REVERSE,
+            "descending": DIRECTION_REVERSE,
+            "down": DIRECTION_REVERSE,
+            "正后反": DIRECTION_FORWARD_REVERSE,
+            "先正向再反向": DIRECTION_FORWARD_REVERSE,
+            "先升后降": DIRECTION_FORWARD_REVERSE,
+            "反后正": DIRECTION_REVERSE_FORWARD,
+            "先反向再正向": DIRECTION_REVERSE_FORWARD,
+            "先降后升": DIRECTION_REVERSE_FORWARD,
+        }
+    )
+    return table
+
+
+_DIRECTION_ALIASES = _build_direction_aliases()
 
 # ── 1 秒窗口多点采样（2026-10-27 主人要求）─────────────────────────────────
 # 原来的读法是「截一次图 → 全屏 OCR → 取那个数」，一次就是 5.5 秒，而这一秒里
@@ -254,6 +351,7 @@ SCAN_UI_KEY_MAP = {
     "重测等待秒数": "retry_wait",
     "连续异常次数": "retry_max",
     "异常后继续测试": "continue_on_abnormal",
+    "保留异常读数": "keep_abnormal",
     "读数异常发送邮件": "notify_enabled",
     "读数采样": "sample_enabled",
     "采样时长": "sample_window_sec",
@@ -277,6 +375,7 @@ SCAN_DEFAULT_VALUES = {
     "retry_wait": "3",
     "retry_max": "5",
     "continue_on_abnormal": "true",
+    "keep_abnormal": "true",
     "notify_enabled": "true",
     "sample_enabled": "true",
     "sample_window_sec": "1",
@@ -314,9 +413,17 @@ MAIL_PARAM_KEYS = (
 
 # 跨节点共享的运行状态；每次 laser_sweep_begin 都会整体重置
 _state: dict[str, Any] = {
-    "values": [],  # ["20", "21", ..., "30"]
-    "index": 0,  # 当前跑到第几组
-    "csv_path": None,  # 绝对路径 Path
+    "values": [],  # 当前这一段的 ["20", "21", ..., "30"]（反向时是 ["30", ..., "20"]）
+    "index": 0,  # 当前这一段跑到第几组
+    "csv_path": None,  # 当前这一段 CSV 的绝对路径 Path
+    # ── 扫描方向与分段（2026-10-30 新增）──────────────────────────────────
+    "direction_label": DIRECTION_LABELS[DEFAULT_DIRECTION],  # 界面上显示的中文名（日志/摘要用）
+    "phases": [],  # [{code,label,values,csv_path,started}, ...]，一项 = 一段扫描 + 一份 CSV
+    "phase_index": 0,  # 当前跑到第几段（0 起）
+    "csv_paths": [],  # 本次扫描已经生成/开始的 CSV（一份或两份），绘图任务用它
+    "csv_header": None,  # 表头，后续分段开新 CSV 时复用
+    "phase_failed": None,  # 下一段建文件失败时记原因（区分「跑完」与「没开起来」）
+    "pending_direction": None,  # LaserSweepDirection 节点解析后暂存，begin 取用后清空
     "out_root": None,  # output 总目录（绝对路径 Path），收尾/按钮打开它
     "open_when_done": True,  # 跑完是否自动打开 output 文件夹
     "measured": None,  # 本轮读到的测量值（float），None 表示没读到
@@ -493,11 +600,90 @@ def _default_csv_stem(
     return "_".join(bits)
 
 
+def _direction_marker(direction: Optional[str]) -> str:
+    """方向代码 → CSV 文件名里的标记（正向 / 反向）；没有方向就返回空串。"""
+    if direction in (DIRECTION_FORWARD, DIRECTION_REVERSE):
+        return DIRECTION_LABELS[direction]
+    return ""
+
+
+def _split_direction_marker(stem: str) -> tuple[str, Optional[str]]:
+    """从文件名主干里拆出方向标记，返回 (基础名, 方向代码)。
+
+        「20261030_153012_20_30_11_正向」→ ("20261030_153012_20_30_11", "forward")
+        没有标记就原样返回 (stem, None)。
+
+    绘图任务靠它把同一轮的正/反两份 CSV 配成一对。
+    """
+    text = str(stem or "")
+    for code in (DIRECTION_FORWARD, DIRECTION_REVERSE):
+        tail = "_" + DIRECTION_LABELS[code]
+        if text.endswith(tail):
+            return text[: -len(tail)], code
+    return text, None
+
+
+def _append_direction_marker(filename: str, direction: Optional[str]) -> str:
+    """在文件名（可带 .csv）里插入方向标记，且**不会重复插入**。
+
+        20261030_153012_20_30_11.csv + forward → …_20_30_11_正向.csv
+        结果.csv                    + reverse → 结果_反向.csv
+        结果_正向.csv               + forward → 结果_正向.csv（不会变成 _正向_正向）
+    """
+    marker = _direction_marker(direction)
+    if not marker:
+        return filename
+    text = str(filename)
+    suffix = ""
+    if text.lower().endswith(".csv"):
+        text, suffix = text[:-4], text[-4:]
+    # 用户自己起的名字里如果已经带标记，先摘掉再按本次方向写，保证幂等
+    base, _existing = _split_direction_marker(text)
+    return f"{base}_{marker}{suffix}"
+
+
+def _resolve_csv_base_name(
+    param: dict[str, Any],
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    total: Optional[int] = None,
+) -> str:
+    """算出 CSV 的「基础文件名」（不含方向标记、不含 .csv）。
+
+    两段扫描（先正后反 / 先反后正）必须共用同一个基础名：
+    两个方向标记 + 同一个时间戳，才看得出这是同一轮对照数据；
+    绘图任务也能按「基础名 + 标记」把两份 CSV 配成一对。
+    """
+    stem = str(param.get("csv_name") or "").strip().strip('"').strip("'")
+    if stem:
+        return _sanitize_name(_expand_time_format(stem), DEFAULT_CSV_STEM)
+    return _default_csv_stem(start, end, total)
+
+
+def _resolve_run_name(param: dict[str, Any]) -> str:
+    """算出「本次结果的子文件夹名」（不含 output 总目录）。
+
+    两段扫描必须共用同一个子文件夹：如果「结果文件夹名」里写了
+    %H%M%S / {datetime} 这类时间占位符，第二段开始时间已经过去几分钟，
+    现算就会落到**另一个文件夹**里 —— 两份 CSV 分开两个目录，
+    「同一轮对照数据」的意义就没了。所以 begin 只算一次，两段都传进去。
+    """
+    run_dir = str(param.get("csv_dir") or "").strip().strip('"').strip("'")
+    run_name = _sanitize_name(_expand_time_format(run_dir), "")
+    if not run_name:
+        run_name = datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT)
+    # 万一用户填的模板把名字洗没了（比如全是非法字符），兜到默认时间名
+    return _sanitize_name(run_name, datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT))
+
+
 def _resolve_output_paths(
     param: dict[str, Any],
     start: Optional[float] = None,
     end: Optional[float] = None,
     total: Optional[int] = None,
+    direction: Optional[str] = None,
+    base_name: Optional[str] = None,
+    run_name: Optional[str] = None,
 ) -> tuple[Path, Path]:
     """算出「本次扫描的结果文件」和「output 总目录」，返回 (csv_path, out_root)。
 
@@ -514,6 +700,13 @@ def _resolve_output_paths(
     start / end / total 是本次扫描的区间与实际组数，只用于拼默认文件名；
     拿不到（None）时默认名退化成「只有时间」。
 
+    direction  给定时在文件名末尾加「_正向 / _反向」标记（2026-10-30 起，
+               扫描流程总会传；不传则保持老命名，方便旧调用方/自检）。
+    base_name  两段扫描时由 begin 先算一次再分别传入，保证两份 CSV 的时间戳
+               和区间段完全一致，只有方向标记不同。
+    run_name   两段扫描时同样由 begin 先算一次再传入。不传就现算
+               （「结果文件夹名」里的时间占位符会取当前时间）。
+
     兼容老行为：csv_dir 以前是「结果直接落在哪个文件夹」。
     现在它的语义变成「output 下面的子文件夹名」，
     但填绝对路径时仍旧当成总目录（老用户写 D:\\数据 不会突然跑到软件目录下）。
@@ -526,28 +719,36 @@ def _resolve_output_paths(
     # ── 老写法 csv_path：直接给完整文件路径 ────────────────────────────────
     # 只在「新参数一个都没填」时才认它 —— 否则用户换到新界面后，
     # 旧的 csv_path 会把新设置悄悄顶掉。
-    if not (run_dir or stem):
+    if not (run_dir or stem) and base_name is None:
         legacy = str(param.get("csv_path") or "").strip().strip('"').strip("'")
         if legacy:
             target = _resolve(legacy)
+            # 两段扫描时同一个老路径会互相覆盖，所以方向标记也要加上
+            if direction:
+                target = target.parent / _append_direction_marker(target.name, direction)
             print(f"[laser_sweep] 用的是旧版 csv_path 参数：{target}")
             return target, target.parent
 
     # 用户填了就照用户的写（同样支持 %Y%m%d / {datetime} 这类时间占位符）；
     # 留空才用「时间_起始值_终止值_总点数」这个默认名。
-    if stem:
+    if base_name is not None:
+        filename = _sanitize_name(base_name, DEFAULT_CSV_STEM)
+    elif stem:
         filename = _sanitize_name(_expand_time_format(stem), DEFAULT_CSV_STEM)
     else:
         filename = _default_csv_stem(start, end, total)
     filename = _sanitize_name(filename, DEFAULT_CSV_STEM)
+    # 方向标记必须在 .csv 之前插入，且要在补扩展名之前做
+    filename = _append_direction_marker(filename, direction)
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
 
-    run_name = _sanitize_name(_expand_time_format(run_dir), "")
-    if not run_name:
-        run_name = datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT)
-    # 万一用户填的模板把名字洗没了（比如全是非法字符），兜到默认时间名
-    run_name = _sanitize_name(run_name, datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT))
+    if run_name is None:
+        run_name = _resolve_run_name(param)
+    else:
+        run_name = _sanitize_name(
+            run_name, datetime.now().strftime(DEFAULT_RUN_DIR_FORMAT)
+        )
 
     # ── 总目录 ────────────────────────────────────────────────────────────
     root_raw = str(param.get("output_root") or "").strip().strip('"').strip("'")
@@ -560,6 +761,92 @@ def _resolve_output_paths(
 
     out_root = _resolve(str(root_path))
     return out_root / run_name / filename, out_root
+
+
+def _write_csv_header(csv_path: Path, header: Any) -> bool:
+    """新建/清空一份 CSV 并写表头。
+
+    每段扫描开始都要调用一次（2026-10-30 起两段方向各有一份 CSV）：
+    覆盖写是刻意的 —— 同一个路径被重复使用时，旧数据不能混进新结果。
+    """
+    try:
+        target = Path(csv_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(header or DEFAULT_HEADER)
+    except OSError as exc:
+        print(f"[laser_sweep] 创建 CSV 失败: {exc}")
+        print(f"[laser_sweep]   目标路径：{csv_path}")
+        return False
+    return True
+
+
+def _csv_data_row_count(path: Any) -> int:
+    """数一份 CSV 里有几行**数据记录**（含空值占位行，不含表头）。
+
+    和「可绘制点数」是两个概念：一行测量值为空（读数失败占位）仍然是
+    一条数据记录，但画不出点。前者用于中止/收尾时如实报「写了多少行」，
+    后者用于绘图前判断「这份 CSV 有没有可画的点」。
+
+    实现注意：
+      · 用 csv.reader 按记录解析（备注里带引号的换行不会算成两行）；
+      · 编码复用 plot_curve._ENCODINGS（现场 CSV 可能是 GBK）；
+      · 首行是否表头用 plot_curve._first_row_looks_numeric 判断，
+        兼容**无表头 CSV**（单行无表头不能被误判成「只有表头」）。
+    """
+    target = Path(path)
+    try:
+        raw = target.read_bytes()
+    except OSError:
+        return 0
+    try:
+        import plot_curve
+
+        encodings = tuple(getattr(plot_curve, "_ENCODINGS", ())) or (
+            "utf-8-sig", "utf-8", "gbk", "cp936", "latin-1",
+        )
+    except Exception:  # noqa: BLE001
+        encodings = ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1")
+    text: Optional[str] = None
+    for encoding in encodings:
+        try:
+            text = raw.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:  # 理论上 latin-1 总能成功；保底不抛
+        return 0
+    try:
+        rows = [
+            row
+            for row in csv.reader(text.splitlines())
+            if any(str(cell).strip() for cell in row)
+        ]
+    except csv.Error:
+        rows = [line.split(",") for line in text.splitlines() if line.strip()]
+    if not rows:
+        return 0
+    try:
+        import plot_curve
+
+        has_header = not plot_curve._first_row_looks_numeric(rows[0])
+    except Exception:  # noqa: BLE001 - 没有绘图模块时按「全是数据」处理
+        has_header = False
+    return len(rows) - 1 if has_header else len(rows)
+
+
+def _csv_plot_point_count(path: Any) -> int:
+    """这份 CSV 能画出几个有效点（X/Y 都能解析才算）；解析失败按 0 处理。
+
+    只用于绘图前的「是不是空图」判断；不要把它的结果当成 CSV 行数 ——
+    空值占位行是数据记录，但画不出点。
+    """
+    try:
+        import plot_curve
+
+        return len(plot_curve.read_curve_csv(Path(path)).x_values)
+    except Exception:  # noqa: BLE001 - 交给调用方的兜底逻辑
+        return _csv_data_row_count(path)
 
 
 def _open_folder(path: Path) -> bool:
@@ -614,16 +901,28 @@ def _state_file() -> Path:
     return _resolve("laser_sweep_output.json")
 
 
-def _remember_output_root(root: Path, csv_path: Optional[Path] = None) -> None:
+def _remember_output_root(
+    root: Path,
+    csv_path: Optional[Path] = None,
+    csv_paths: Optional[list[Path]] = None,
+) -> None:
     """记下「最近一次实际使用的输出总目录」，顺手记下这次的 CSV 路径。
 
     2026-10-28 新增 last_csv：新任务「绘制曲线图」要默认画**最近导出的单个 CSV**。
     只记 output_root 的话，它得在目录里按修改时间猜 —— 如果用户刚手动往
     output 里放了一份旧数据，猜出来的就可能不是这次扫描的结果。直接记下
     begin 时算好的 csv_path，任务一读就知道该画哪一份，和「最近一次扫描」严格对应。
+
+    2026-10-30 新增 csv_paths（列表）：两段扫描（先正后反 / 先反后正）会生成
+    两份 CSV，绘图任务要把两张图都画出来。last_csv 继续保留 = 最后一份，
+    老的读取方（以及只在单份 CSV 时代的自检）不会受影响。
     """
     payload: dict[str, Any] = {"output_root": str(root)}
-    if csv_path is not None:
+    paths = [Path(p) for p in (csv_paths or []) if p is not None]
+    if paths:
+        payload["csv_paths"] = [str(p) for p in paths]
+        payload["last_csv"] = str(paths[-1])
+    elif csv_path is not None:
         payload["last_csv"] = str(csv_path)
     try:
         _state_file().write_text(
@@ -647,19 +946,48 @@ def _recall_output_root() -> Optional[Path]:
     return Path(raw) if raw else None
 
 
+def _read_state_payload() -> dict[str, Any]:
+    """读 laser_sweep_output.json；不存在/读坏了都返回空字典（绝不抛）。"""
+    path = _state_file()
+    try:
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _recall_csv_paths() -> list[Path]:
+    """读回「最近一次扫描生成的 CSV 列表」（2026-10-30 新增 csv_paths 字段）。
+
+    兼容老状态文件：没有 csv_paths 就退回 last_csv，返回 0~1 个元素。
+    和 _recall_last_csv 一样**不检查文件是否存在**，由调用方判断。
+
+    为什么绘图任务需要它：两段扫描会生成两份 CSV，程序重启后也必须知道
+    「上次那一轮出了哪两份」，才能把两张图都画出来，而不是只画最后一份。
+    """
+    data = _read_state_payload()
+    raw_list = data.get("csv_paths")
+    paths: list[Path] = []
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            text = str(item or "").strip()
+            if text:
+                paths.append(Path(text))
+    if paths:
+        return paths
+    single = _recall_last_csv()
+    return [single] if single is not None else []
+
+
 def _recall_last_csv() -> Optional[Path]:
     """读回「最近一次扫描的 CSV 路径」（老状态文件里没有这个字段就返回 None）。
 
     注意：这里**不检查文件是否存在** —— 调用方要负责判断，因为老文件可能
     已经被使用者挪走/改名。返回 None 时才表示"状态文件根本没有这条记录"。
     """
-    path = _state_file()
-    try:
-        if not path.is_file():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    data = _read_state_payload()
     raw = str(data.get("last_csv") or "").strip()
     return Path(raw) if raw else None
 
@@ -915,6 +1243,291 @@ def _resolve_count(param: dict[str, Any]) -> list[str]:
         print(f"[laser_sweep] 「扫描点数」只能填整数：{raw!r}，已按「按步长扫描」处理")
         return []
     return [int(value)]
+
+
+def _normalize_direction(raw: Any) -> Optional[str]:
+    """把界面/配置里的方向写法解析成标准代码；认不出返回 None。"""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    # 英文别名大小写/连字符/空格都不敏感；中文按原样匹配
+    key = text.lower().replace("-", "_").replace(" ", "")
+    if key in _DIRECTION_ALIASES:
+        return _DIRECTION_ALIASES[key]
+    if text in _DIRECTION_ALIASES:
+        return _DIRECTION_ALIASES[text]
+    return None
+
+
+def _direction_phases(direction: Optional[str]) -> list[str]:
+    """方向 → 实际要跑的分段顺序（每段一种方向、一份 CSV）。"""
+    code = _normalize_direction(direction) or DEFAULT_DIRECTION
+    return list(DIRECTION_PHASES[code])
+
+
+def _direction_plan_text(direction: str, start: float, end: float) -> str:
+    """给日志/摘要用的方向说明。
+
+    单方向：`反向（30 → 20）`（方向名只出现一次，避免「反向（反向 30 → 20）」）
+    两段：  `先正后反（正向 20 → 30，再反向 30 → 20）`
+    """
+    codes = _direction_phases(direction)
+    forward = DIRECTION_FORWARD
+    parts = []
+    for code in codes:
+        arrow = f"{_fmt(start)} → {_fmt(end)}" if code == forward else f"{_fmt(end)} → {_fmt(start)}"
+        parts.append(f"{DIRECTION_LABELS[code]} {arrow}")
+    label = DIRECTION_LABELS.get(direction, DIRECTION_LABELS[DEFAULT_DIRECTION])
+    if len(codes) == 1:
+        arrow = f"{_fmt(start)} → {_fmt(end)}" if codes[0] == forward else f"{_fmt(end)} → {_fmt(start)}"
+        return f"{label}（{arrow}）"
+    return f"{label}（{'，再'.join(parts)}）"
+
+
+def _node_custom_param(node: Any, kind: str) -> dict[str, Any]:
+    """从 get_node_data 的返回里取自定义动作/识别参数（兼容 V1 扁平与 V2 嵌套）。
+
+    MaaFramework 5.x 的 MaaContextGetNodeData 返回的是 **V2 结构**：
+        {"action": {"type": "Custom", "param": {"custom_action_param": {...}}},
+         "recognition": {"type": "Custom", "param": {"custom_recognition_param": {...}}}}
+    而本项目历史代码（以及自检桩）一直按 V1 扁平结构读：
+        {"custom_action_param": {...}}
+    2026-10-30 用 MaaFramework 5.13.1 实测确认：返回值里**没有**顶层
+    custom_action_param —— 只按旧格式读会让「读方向节点参数」这条兜底永远失效。
+
+    kind 取 "action" 或 "recognition"。
+    """
+    if not isinstance(node, dict):
+        return {}
+    key = f"custom_{kind}_param"
+    section = node.get(kind)
+    blocks: list[Any] = []
+    if isinstance(section, dict):
+        # V2：参数在 section["param"] 里；有些版本/自检桩也可能平铺在 section 上
+        blocks.append(section.get("param"))
+        blocks.append(section)
+    blocks.append(node)  # V1：参数直接在节点顶层
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        raw = block.get(key)
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            parsed = _param(raw)
+            if parsed:
+                return parsed
+    return {}
+
+
+def _read_direction_from_node(context: Optional[Context]) -> Optional[str]:
+    """向框架要「扫描方向」节点当前的参数（框架已把界面 override 合并进去）。"""
+    if context is None:
+        return None
+    try:
+        node = context.get_node_data(DIRECTION_NODE)
+    except Exception as exc:  # noqa: BLE001 - 只是兜底路径，读不到就走后面的来源
+        print(f"[laser_sweep]   （读不到「扫描方向」节点参数：{type(exc).__name__}: {exc}）")
+        return None
+    if not isinstance(node, dict):
+        return None
+    return _normalize_direction(_node_custom_param(node, "action").get("direction"))
+
+
+def _resolve_direction(context: Optional[Context], param: dict[str, Any]) -> str:
+    """决定这次扫描的方向。优先级（从可靠到兜底）：
+
+        ① LaserSweepDirection 节点刚跑过、把方向暂存在 _state 里
+        ② 本节点参数里的 direction（直接调用 begin 时可用）
+        ③ 问框架要 LaserSweepDirection 节点的当前参数（override 已合并）
+        ④ MFA 任务配置里保存的「扫描方向」选中项（老实例配置兜底）
+        ⑤ 都没有 → 正向，并明确打一行告警
+
+    为什么默认值要打告警：方向选「反向」却按正向跑，数据本身还是能用的，
+    但和用户预期相反，而且不报错 —— 属于最难发现的一类问题。宁可日志吵一点。
+    """
+    pending = _normalize_direction(_state.get("pending_direction"))
+    if pending:
+        print(f"[laser_sweep] 扫描方向：{DIRECTION_LABELS[pending]}（来自「扫描方向」节点）")
+        return pending
+
+    own = _normalize_direction(param.get("direction"))
+    if own:
+        print(f"[laser_sweep] 扫描方向：{DIRECTION_LABELS[own]}（来自节点参数）")
+        return own
+
+    from_node = _read_direction_from_node(context)
+    if from_node:
+        print(f"[laser_sweep] 扫描方向：{DIRECTION_LABELS[from_node]}（读取流水线里「扫描方向」节点的参数）")
+        return from_node
+
+    from_task = _load_direction_from_task_config()
+    if from_task:
+        return from_task
+
+    raw = param.get("direction")
+    if raw is not None and str(raw).strip():
+        print(
+            f"[laser_sweep] ⚠️ 扫描方向「{raw}」无法识别，按正向（从小到大）扫描；"
+            "请到界面的「扫描方向」里重新选择"
+        )
+    else:
+        print(
+            "[laser_sweep] ⚠️ 没读到扫描方向设置（界面与流水线版本可能不一致），按正向（从小到大）扫描"
+        )
+    return DEFAULT_DIRECTION
+
+
+def _build_phase_values(
+    start: float,
+    end: float,
+    step: float,
+    count: Optional[int],
+    phase: str,
+) -> list[str]:
+    """生成某一段的参数序列：正向升序，反向把同一组序列整个倒过来。
+
+    为什么反向不是「start/end 互换后重新算」：两种写法在浮点步长下
+    （例如 20→30 步长 0.1、或者点数模式反算出 23.333333）可能得到
+    不完全对称的序列。直接倒排保证**同一组点、只是顺序相反**，
+    正反两轮严格一一对照，用来看迟滞/回程差最干净。
+    """
+    values = _build_values(start, end, step, count)
+    if phase == DIRECTION_REVERSE:
+        return list(reversed(values))
+    return values
+
+
+def _planned_total() -> int:
+    """本次扫描计划的总组数（所有分段相加）；没有分段信息时退回当前段的组数。"""
+    phases = _state.get("phases")
+    if isinstance(phases, list) and phases:
+        total = 0
+        for phase in phases:
+            if isinstance(phase, dict):
+                total += len(phase.get("values") or [])
+        if total:
+            return total
+    return len(_state.get("values") or [])
+
+
+def _completed_total() -> int:
+    """已经真正跑完的组数：只统计已开始（started）的分段。
+
+    和 _planned_total 的区别在「第二段建文件失败」这种场景：
+    计划是 22 组，但实际只完成第一段的 11 组 —— 收尾日志必须说实话。
+    """
+    phases = _state.get("phases")
+    if isinstance(phases, list) and phases:
+        done = 0
+        for phase in phases:
+            if isinstance(phase, dict) and phase.get("started"):
+                done += len(phase.get("values") or [])
+        return done
+    return len(_state.get("values") or [])
+
+
+def _phase_log_prefix() -> str:
+    """两段扫描时给日志行加 `[正向] ` / `[反向] ` 前缀，单段时返回空串。"""
+    phases = _state.get("phases")
+    if not isinstance(phases, list) or len(phases) <= 1:
+        return ""
+    index = int(_state.get("phase_index") or 0)
+    if 0 <= index < len(phases) and isinstance(phases[index], dict):
+        label = str(phases[index].get("label") or "")
+        return f"[{label}] " if label else ""
+    return ""
+
+
+def _phase_plan_text() -> str:
+    """「第 1/2 段（正向）」这样的一句话；单段扫描返回空串。"""
+    phases = _state.get("phases")
+    if not isinstance(phases, list) or len(phases) <= 1:
+        return ""
+    index = int(_state.get("phase_index") or 0)
+    label = ""
+    if 0 <= index < len(phases) and isinstance(phases[index], dict):
+        label = str(phases[index].get("label") or "")
+    return f"第 {index + 1}/{len(phases)} 段" + (f"（{label}）" if label else "")
+
+
+def _start_next_phase() -> bool:
+    """当前段跑完后，切到下一段（新建它的 CSV、重置组号）并继续扫描。
+
+    返回 False 表示「没有下一段了」或「下一段的 CSV 建不出来」——
+    两种情况调用方都会走收尾节点。后一种会额外记一条 `_state["phase_failed"]`，
+    让 LaserSweepAdvance / 摘要能区分「正常跑完」和「第二段没开起来」，
+    不再把只跑了 11 组的扫描说成「已完成全部 22 组」。
+    """
+    phases = _state.get("phases")
+    if not isinstance(phases, list) or not phases:
+        return False
+    next_index = int(_state.get("phase_index") or 0) + 1
+    if next_index >= len(phases):
+        return False
+    phase = phases[next_index]
+    if not isinstance(phase, dict):
+        return False
+
+    def _mark_failed(reason: str) -> bool:
+        _state["phase_failed"] = {
+            "index": next_index,
+            "label": str(phase.get("label") or ""),
+            "reason": reason,
+        }
+        return False
+
+    csv_path = phase.get("csv_path")
+    if not isinstance(csv_path, Path):
+        print("[laser_sweep] ⚠️ 下一段的结果文件路径无效，本节收尾")
+        return _mark_failed("结果文件路径无效")
+    header = _state.get("csv_header") or DEFAULT_HEADER
+    if not _write_csv_header(csv_path, header):
+        print("[laser_sweep] ⚠️ 下一段的结果文件没能建好，扫描到此收尾（已跑完的数据不受影响）")
+        return _mark_failed("结果文件没能创建")
+
+    _state.pop("phase_failed", None)
+    phase["started"] = True
+    _state["phase_index"] = next_index
+    _state["values"] = list(phase.get("values") or [])
+    _state["index"] = 0
+    _state["csv_path"] = csv_path
+    _state["measured"] = None
+    _state["last_note"] = ""
+
+    paths = _state.get("csv_paths")
+    if not isinstance(paths, list):
+        paths = []
+    if csv_path not in paths:
+        paths.append(csv_path)
+    _state["csv_paths"] = paths
+
+    # 每段的重测计数清干净；reference（上一个可信读数）**保留** ——
+    # 两段的首尾恰好是同一个设定值（正向最后一点 = 反向第一点），
+    # 保留基准有利于把两段接起来看，也符合「基准跨点保留」的既有语义。
+    guard = _state.get("guard")
+    if isinstance(guard, dict):
+        guard["strikes"] = 0
+        guard["abnormal"] = []
+        guard["point_index"] = 0
+    failures = _state.get("sample_failures")
+    if isinstance(failures, dict):
+        failures.clear()
+
+    root = _state.get("out_root")
+    if root is not None:
+        _remember_output_root(Path(root), csv_path=csv_path, csv_paths=paths)
+
+    values = _state["values"]
+    span = f"{values[0]} → {values[-1]}" if values else "?"
+    print(
+        f"[laser_sweep] ── 第 {next_index + 1}/{len(phases)} 段开始："
+        f"{phase.get('label') or ''}（{span}，{len(values)} 组）──"
+    )
+    print(f"[laser_sweep] 结果文件：{csv_path}")
+    return True
 
 
 def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -1254,12 +1867,16 @@ def _choose_anchor_by_hint(
     return min(anchors, key=gap)
 
 
-def _append_row(measured: Optional[float]) -> bool:
+def _append_row(measured: Optional[float], note: Optional[str] = None) -> bool:
     """把当前这一组结果追加写入 CSV。
 
     measured 是**这一组已经合成好的值**：1 秒多点采样那套逻辑会先把十几次读数
     的平均数算出来再交过来（见 _aggregate_samples），所以这里写的永远是"一个数"，
     不会因为采样把一行拆成十几行 —— 行号与设定参数一一对应的约定不变。
+
+    note 是这一行要写进「备注」列的说明。显式传了就用它（比如「连续5次异常，
+    保留读数」）；不传时保持老逻辑：跳变备注优先，空值行再用 _state["last_note"]
+    兜底成「读数失败」。这样正常行不会沾上上一行留下的备注。
     """
     csv_path = _state.get("csv_path")
     values, index = _state["values"], _state["index"]
@@ -1274,24 +1891,32 @@ def _append_row(measured: Optional[float]) -> bool:
     #      也就是说我在日志里承诺的"摘要会列出跳变"根本没落地，
     #      可疑值仍然以普通有效数据的样子交付出去。
     # 现在：走过「稳定但可疑 → 判为真实跳变」那条路的行，备注写 `跳变(自 -14.68)`；
-    #      连续异常判废写空值时的原因也写在这里。留空 = 常规读数，无任何可疑标记。
+    #      连续异常判废、保留异常读数的原因也写在这里。留空 = 常规读数，无任何可疑标记。
     #      四列顺序保持不动（Excel 里已有的模板/图表不会错位），只在末尾追加。
-    note = ""
-    jumps = _state.get("jumps")
-    if isinstance(jumps, list):
-        for item in reversed(jumps):
-            if int(item.get("index") or -1) == index + 1:
-                note = "跳变(自 %s)" % _fmt(float(item.get("from") or 0))
-                break
-    if not note and measured is None:
-        note = str(_state.get("last_note") or "读数失败")
+    note_text = str(note or "").strip()
+    if not note_text:
+        jumps = _state.get("jumps")
+        if isinstance(jumps, list):
+            # 跳变记录带段号（2026-10-30 两段扫描）：正/反两段的组号都从 1 开始，
+            # 不按段过滤的话，第 2 段第 1 行会错拿第 1 段第 1 行的跳变标记。
+            current_phase = int(_state.get("phase_index") or 0)
+            for item in reversed(jumps):
+                if not isinstance(item, dict):
+                    continue
+                if int(item.get("phase", current_phase) or 0) != current_phase:
+                    continue
+                if int(item.get("index") or -1) == index + 1:
+                    note_text = "跳变(自 %s)" % _fmt(float(item.get("from") or 0))
+                    break
+    if not note_text and measured is None:
+        note_text = str(_state.get("last_note") or "读数失败")
 
     row = [
         index + 1,
         values[index],
         "" if measured is None else _fmt(measured),
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        note,
+        note_text,
     ]
 
     try:
@@ -1304,7 +1929,7 @@ def _append_row(measured: Optional[float]) -> bool:
 
     shown = row[2] if row[2] != "" else "(空)"
     tail = f", 备注={row[4]}" if row[4] else ""
-    print(f"[laser_sweep] 已记录第 {row[0]} 行：设定={row[1]}, 测量={shown}{tail}")
+    print(f"[laser_sweep] {_phase_log_prefix()}已记录第 {row[0]} 行：设定={row[1]}, 测量={shown}{tail}")
     return True
 
 
@@ -1820,6 +2445,106 @@ def _load_scan_settings_from_task() -> dict[str, Any]:
     return dict(best)
 
 
+def _extract_direction_from_task(root: Any) -> Optional[str]:
+    """从 MFA 保存的任务配置里读「扫描方向」下拉框的选中项（2026-10-30 兜底）。
+
+    为什么需要这层：老用户的 config/instances/*.json 里任务 entry 还是
+    LaserSweepStart、也没有新 option；如果 MFA 升级后不自动补上新 option，
+    方向 case 的 pipeline_override 就不会传给 agent。这里直接从任务配置的
+    保存值里读选中的 case 名（中文名可直接走 _normalize_direction），
+    作为「框架没有把 override 传下来」时的最后一道保险。
+
+    兼容几种保存形态（不同 MFA 版本不同）：
+        {"name":"扫描方向","selected_cases":["反向"]}
+        {"name":"扫描方向","data":"反向"}
+        {"name":"扫描方向","data":{"扫描方向":"反向"}}
+        老版 option 字典：{"扫描方向":"反向"}
+    """
+    if not isinstance(root, dict):
+        return None
+    tasks = root.get("TaskItems")
+    if not isinstance(tasks, list):
+        tasks = root.get("task")
+    if not isinstance(tasks, list):
+        return None
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("name") or "").strip() != SCAN_TASK_NAME:
+            continue
+        option = task.get("option")
+        candidates: list[Any] = []
+
+        def _iter_options(items: Any):
+            """递归遍历 task.option 列表及其 sub_options（扫描方向现在是扫描设置的子项）。"""
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    yield item
+                    yield from _iter_options(item.get("sub_options"))
+
+        if isinstance(option, list):
+            for item in _iter_options(option):
+                if str(item.get("name") or "").strip() == "扫描方向":
+                    candidates.append(item)
+        elif isinstance(option, dict):
+            raw = option.get("扫描方向")
+            if raw is not None:
+                candidates.append(raw)
+
+        for item in candidates:
+            if not isinstance(item, dict):
+                code = _normalize_direction(item)
+                if code:
+                    return code
+                continue
+            for key in ("selected_cases", "selected_case"):
+                raw = item.get(key)
+                if isinstance(raw, list):
+                    for value in raw:
+                        code = _normalize_direction(value)
+                        if code:
+                            return code
+                else:
+                    code = _normalize_direction(raw)
+                    if code:
+                        return code
+            data = item.get("data")
+            if isinstance(data, str):
+                code = _normalize_direction(data)
+                if code:
+                    return code
+            elif isinstance(data, dict):
+                for key in ("扫描方向", "direction", "value"):
+                    code = _normalize_direction(data.get(key))
+                    if code:
+                        return code
+            for key in ("case", "value"):
+                code = _normalize_direction(item.get(key))
+                if code:
+                    return code
+    return None
+
+
+def _load_direction_from_task_config() -> Optional[str]:
+    """扫描所有 MFA 配置文件，返回「扫描方向」保存的选中项（读不到就 None）。"""
+    for path in _mail_task_config_files():
+        try:
+            root = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        code = _extract_direction_from_task(root)
+        if code:
+            print(
+                f"[laser_sweep] 扫描方向：{DIRECTION_LABELS[code]}"
+                "（来自任务配置保存的选择）"
+            )
+            return code
+    return None
+
+
 def _merge_scan_settings_from_task(param: dict[str, Any]) -> dict[str, Any]:
     """把「任务配置里保存的折叠分组设置」合并进节点参数。
 
@@ -2067,6 +2792,10 @@ def _resolve_guard_param(param: dict[str, Any]) -> dict[str, Any]:
     # 告警邮件发出去之后，主人未必能马上处理，让它跑完比停在半路更实用。
     continue_on_abnormal = _flag(param.get("continue_on_abnormal"), DEFAULT_CONTINUE_ON_ABNORMAL)
 
+    # 判废时是否保留最后一次异常读数（2026-10-29 新增，默认保留）。
+    # 保留后 CSV 不会留下空行，画图时曲线不会缺点；关掉则回到空值占位。
+    keep_abnormal = _flag(param.get("keep_abnormal"), DEFAULT_KEEP_ABNORMAL)
+
     return {
         "enabled": enabled,
         "tolerance_abs": tolerance_abs,
@@ -2085,6 +2814,8 @@ def _resolve_guard_param(param: dict[str, Any]) -> dict[str, Any]:
         "notify_enabled": want_mail,
         # 连续异常到顶之后：True = 继续扫下一个点，False = 终止扫描
         "continue_on_abnormal": continue_on_abnormal,
+        # 判废时是否把最后一次异常读数留在 CSV 里（True = 保留，默认）
+        "keep_abnormal": keep_abnormal,
     }
 
 
@@ -2122,6 +2853,8 @@ def _compose_alert(
     started_at: str,
     retry_max: int,
     continuing: bool = False,
+    keeping: bool = False,
+    phase_text: str = "",
 ) -> dict[str, Any]:
     """组装告警邮件：返回 {subject, body, expected, abnormal, summary}。
 
@@ -2192,14 +2925,16 @@ def _compose_alert(
     # 2026-10-27 起默认继续扫描，如果信里还写「已终止」，收信人会去查一个
     # 其实还在正常跑的扫描，白跑一趟。
     strikes = len(abnormal) or retry_max
+    # 两段扫描时主题也带段号，否则「第 3/11 组」在两段里各出现一次，收信人会混
+    phase_subject = f"{phase_text} " if phase_text else ""
     if continuing:
         subject = (
-            f"读数异常告警：第 {current_no}/{total} 组（设定 {current_value}）"
+            f"读数异常告警：{phase_subject}第 {current_no}/{total} 组（设定 {current_value}）"
             f"连续 {strikes} 次异常，已跳过并继续扫描"
         )
     else:
         subject = (
-            f"读数异常告警：第 {current_no}/{total} 组（设定 {current_value}）"
+            f"读数异常告警：{phase_subject}第 {current_no}/{total} 组（设定 {current_value}）"
             f"连续 {strikes} 次异常，已终止扫描"
         )
 
@@ -2211,7 +2946,11 @@ def _compose_alert(
             if continuing
             else "  已停止扫描，避免继续把不可信的数据写进结果文件。"
         ),
-        "  CSV 里这一组写的是空值占位，行号与参数仍一一对应。",
+        (
+            "  CSV 里这一组保留的是最后一次异常读数（备注列已标记），曲线不会缺点；"
+            if keeping
+            else "  CSV 里这一组写的是空值占位，行号与参数仍一一对应。"
+        ),
     ]
 
     body = "\n".join(
@@ -2239,6 +2978,7 @@ def _compose_alert(
             f"  本次扫描总耗时：{_fmt_elapsed(elapsed_sec)}",
             f"  进度：第 {current_no} 组 / 共 {total} 组"
             f"（已完成 {min(index, total)} 组）",
+            f"  当前段：{phase_text or '单段扫描'}",
             f"  开始时间：{started_at or '(未知)'}",
             f"  终止时间：{now_text}",
             f"  结果文件：{csv_text}",
@@ -3005,6 +3745,39 @@ def _screencap_window(
 
 
 # --------------------------------------------------------------------------- #
+# ⓪ 扫描方向（2026-10-30 新增）
+#
+# 为什么单独占一个流水线节点：界面上的下拉框（PI V2 的 select 类型）只能靠
+# 「选中项自己的 pipeline_override」把值传进来，而 pipeline_override 对节点的
+# custom_action_param 是**整体替换** —— 如果让方向选项也去覆盖 LaserSweepStart，
+# 就会把起始值/步长/输出目录那一整块参数顶掉（2026-10-27 踩过同样的坑）。
+#
+# 所以把方向放在独立的 LaserSweepDirection 节点上：
+#   · 它是任务的入口节点，先于 begin 运行；
+#   · 把解析好的方向存进 _state["pending_direction"]，begin 取用后清空；
+#   · begin 自己还会从节点参数 / 框架 pipeline 里兜底读一次，
+#     万一换回了老 interface.json（入口仍是 LaserSweepStart），也能安全地按正向跑，
+#     并在日志里说明没读到方向设置。
+# --------------------------------------------------------------------------- #
+@AgentServer.custom_action("laser_sweep_direction")
+class LaserSweepDirection(CustomAction):
+    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        param = _param(argv.custom_action_param)
+        raw = param.get("direction", DEFAULT_DIRECTION)
+        code = _normalize_direction(raw)
+        if code is None:
+            print(
+                f"[laser_sweep] ⚠️ 扫描方向「{raw}」无法识别，按正向（从小到大）处理；"
+                "可选值：正向 / 反向 / 先正后反 / 先反后正"
+            )
+            code = DEFAULT_DIRECTION
+        # 暂存给紧接着运行的 laser_sweep_begin 取用
+        _state["pending_direction"] = code
+        print(f"[laser_sweep] 扫描方向：{DIRECTION_LABELS[code]}（{DIRECTION_HINTS.get(code, '分段扫描')}）")
+        return True
+
+
+# --------------------------------------------------------------------------- #
 # ① 初始化
 # --------------------------------------------------------------------------- #
 @AgentServer.custom_action("laser_sweep_begin")
@@ -3016,6 +3789,13 @@ class LaserSweepBegin(CustomAction):
         # 换机排查时最怕的就是「文件到底替换成功没有」—— 带上文件名、字节数和
         # 修改时间，一眼就能跟手头那份对上（2026-09-22 就为这个来回猜过一轮）。
         print(f"[laser_sweep] agent 文件：{_agent_fingerprint()}")
+
+        # 先定方向（方向节点是任务入口，已经把它暂存在 _state 里）。
+        # 放在最前面 + 立刻清空暂存：这样即使后面的参数校验失败、
+        # 本次没跑成，也不会把旧方向留给下一次扫描误用。
+        direction = _resolve_direction(context, param)
+        _state["pending_direction"] = None
+        phase_codes = _direction_phases(direction)
 
         start = float(param.get("start", 20))
         end = float(param.get("end", 30))
@@ -3037,10 +3817,18 @@ class LaserSweepBegin(CustomAction):
             print(f"[laser_sweep] 区间不合法：start={_fmt(start)} > end={_fmt(end)}")
             return False
 
-        values = _build_values(start, end, step, count)
-        if not values:
+        base_values = _build_values(start, end, step, count)
+        if not base_values:
             print("[laser_sweep] 参数序列为空")
             return False
+        # 每段一组序列：正向升序、反向把同一组序列整个倒过来。
+        # 反向不重新按 start/end 算，保证两段是「同一组点、只是顺序相反」，
+        # 正反两轮可以严格一一对照（看迟滞/回程差时这点很重要）。
+        # 统一走 _build_phase_values（自检也直接测它，生产/测试共用同一套逻辑）。
+        phase_values = [
+            _build_phase_values(start, end, step, count, code) for code in phase_codes
+        ]
+        planned_total = sum(len(items) for items in phase_values)
 
         # 点数模式下真正的步长是反算出来的（可能与界面上填的步长输入框无关），
         # 所以单独算一份，只用于打印，免得日志里的「步长」骗人。
@@ -3056,35 +3844,70 @@ class LaserSweepBegin(CustomAction):
 
         # ⚠️ 只在「真的填了点数」时才比这个数。count=0 是「按步长」的开关，
         #    它和实际组数天然对不上，以前会打出一句「填的是 0 个点」的假告警。
-        if count and len(values) != count:
+        if count and len(base_values) != count:
             print(
                 f"[laser_sweep] 注意：填的是 {count} 个点，按步长 {_fmt(effective_step)} "
-                f"严格跑下来只有 {len(values)} 个（再下一个点会越过结束值 {_fmt(end)}，故不再生成）"
+                f"严格跑下来只有 {len(base_values)} 个（再下一个点会越过结束值 {_fmt(end)}，故不再生成）"
             )
 
-        # 把区间与实际组数一并传进去：默认文件名要用它们拼成
-        # 「时间_起始值_终止值_总点数」，光看名字就知道这次扫了什么。
-        csv_path, out_root = _resolve_output_paths(
-            param, start=start, end=end, total=len(values)
+        # 两段扫描共用同一个「基础文件名」和「结果子文件夹」：
+        # 两份 CSV 只有方向标记不同、落在同一个文件夹里，
+        # 一眼就能看出是同一轮对照数据，绘图任务也据此把它们配成一对。
+        # （文件夹名里的时间占位符只在这里展开一次，否则第二段会跑到新文件夹。）
+        #
+        # 例外：老版只有 csv_path（完整路径）的老配置 —— 这时不要预生成
+        # base_name/run_name，否则会绕过 csv_path 分支，把用户指定的路径顶掉。
+        stem = str(param.get("csv_name") or "").strip()
+        run_dir = str(param.get("csv_dir") or "").strip()
+        legacy_only = (
+            not (stem or run_dir) and str(param.get("csv_path") or "").strip() != ""
         )
+        base_name = (
+            None
+            if legacy_only
+            else _resolve_csv_base_name(param, start=start, end=end, total=len(base_values))
+        )
+        run_name = None if legacy_only else _resolve_run_name(param)
         header = param.get("csv_header") or DEFAULT_HEADER
 
-        try:
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            # 覆盖写：每次开始扫描都重建表头，避免旧数据混进新结果
-            with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-                csv.writer(f).writerow(header)
-        except OSError as exc:
-            print(f"[laser_sweep] 创建 CSV 失败: {exc}")
-            print(f"[laser_sweep]   目标路径：{csv_path}")
+        phases: list[dict[str, Any]] = []
+        out_root: Optional[Path] = None
+        for index, (code, items) in enumerate(zip(phase_codes, phase_values)):
+            phase_csv, root = _resolve_output_paths(
+                param,
+                start=start,
+                end=end,
+                total=len(items),
+                direction=code,
+                base_name=base_name,
+                run_name=run_name,
+            )
+            if out_root is None:
+                out_root = root
+            phases.append(
+                {
+                    "code": code,
+                    "label": DIRECTION_LABELS[code],
+                    "values": items,
+                    "csv_path": phase_csv,
+                    "started": index == 0,
+                }
+            )
+
+        if out_root is None:  # 理论上不会发生；保住后续类型与逻辑不出错
+            out_root = _resolve(str(param.get("output_root") or OUTPUT_ROOT_NAME))
+        csv_path = phases[0]["csv_path"]
+        csv_paths = [csv_path]
+        # 第一段立刻建表头；后面的段等真正开始再建 —— 中途终止时不会留下
+        # 只有表头的空 CSV（绘图任务会自动跳过这种没有数据行的文件）。
+        if not _write_csv_header(csv_path, header):
             return False
 
         # 记下 output 总目录，收尾时「自动打开文件夹」要用它
         _state["out_root"] = out_root
-        # 顺手落盘一份，好让独立的「打开输出文件夹」和图「绘制曲线图」任务
-        # 也能找到同一个目录 / 同一份 CSV
-        _remember_output_root(out_root, csv_path)
-        # 跑完是否自动打开 output 文件夹（UI 上的开关，默认开）
+        # 顺手落盘一份，好让独立的「打开输出文件夹」和「绘制曲线图」任务
+        # 也能找到同一个目录 / 本次生成的所有 CSV
+        _remember_output_root(out_root, csv_path=csv_path, csv_paths=csv_paths)
         _state["open_when_done"] = _flag(param.get("open_when_done"), True)
 
         # 上一轮找到的 B 软件窗口可能已经关了，清掉重新找
@@ -3137,9 +3960,17 @@ class LaserSweepBegin(CustomAction):
         }
 
         _state.update(
-            values=values,
+            values=list(phases[0]["values"]),
             index=0,
             csv_path=csv_path,
+            # ── 扫描方向 / 分段（2026-10-30）──────────────────────────────
+            direction_label=DIRECTION_LABELS[direction],
+            phases=phases,
+            phase_index=0,
+            csv_paths=csv_paths,
+            csv_header=header,
+            phase_failed=None,
+            pending_direction=None,
             measured=None,
             controls=None,
             sample_param=sample_param,
@@ -3174,11 +4005,19 @@ class LaserSweepBegin(CustomAction):
         )
 
         print(
-            f"[laser_sweep] 参数序列共 {len(values)} 组：{values[0]} → {values[-1]}（"
-            + mode
-            + "）"
+            f"[laser_sweep] 扫描方向：{_direction_plan_text(direction, start, end)}"
+            f" · 共 {len(phases)} 段 / {planned_total} 组（{mode}）"
         )
+        for index, phase in enumerate(phases):
+            items = phase["values"]
+            span = f"{items[0]} → {items[-1]}" if items else "?"
+            print(
+                f"[laser_sweep]   第 {index + 1}/{len(phases)} 段：{phase['label']}"
+                f"（{span}，{len(items)} 组）→ {phase['csv_path'].name}"
+            )
         print(f"[laser_sweep] 结果文件：{csv_path}")
+        if len(phases) > 1:
+            print(f"[laser_sweep]   下一段的结果文件：{phases[1]['csv_path']}（第一段跑完才创建）")
         print(f"[laser_sweep] 输出目录：{out_root}（本次结果在上面的时间子文件夹里，文件名 {csv_path.name}）")
         print(
             "[laser_sweep] 定位缓存：本轮开始先全屏 OCR 一次，之后每轮复用"
@@ -3192,11 +4031,15 @@ class LaserSweepBegin(CustomAction):
                 if guard_param.get("notify_enabled")
                 else "不发邮件（可在主任务里打开「读数异常发送邮件」）"
             )
+            action_note = (
+                "继续扫下一个点" if guard_param.get("continue_on_abnormal") else "终止扫描"
+            )
+            keep_note = "保留异常读数" if guard_param.get("keep_abnormal") else "写空值占位"
             print(
                 "[laser_sweep] 读数校验：开，"
                 f"绝对阈值 {_fmt(guard_param['tolerance_abs'])}，"
                 f"相对 {_fmt(guard_param['tolerance_pct'])}%，"
-                f"连续 {guard_param['retry_max']} 次异常则终止并"
+                f"连续 {guard_param['retry_max']} 次异常则{action_note}并{keep_note}、"
                 + mail_note
                 + f"（重测等待 {_fmt(guard_param['retry_wait'])} 秒）"
             )
@@ -3223,8 +4066,8 @@ class LaserSweepBegin(CustomAction):
             print(f"[laser_sweep] （读不到读数节点参数，跳过采样配置打印: {exc}）")
             node_data = None
         if isinstance(node_data, dict):
-            raw_param = node_data.get("custom_recognition_param")
-            sample_param = _param(raw_param) if isinstance(raw_param, (str, dict)) else {}
+            # 兼容 V2（action/recognition.param 嵌套）与 V1 扁平两种返回格式
+            sample_param = _node_custom_param(node_data, "recognition")
 
         if sample_param:
             if _flag(sample_param.get("sample_enabled"), True):
@@ -3291,7 +4134,9 @@ class LaserSweepApplyParam(CustomAction):
             failures.clear()
 
         _state["measured"] = None  # 清空上一轮结果
-        print(f"[laser_sweep] ▶ 第 {index + 1}/{len(values)} 组：设定参数 = {value}")
+        print(
+            f"[laser_sweep] {_phase_log_prefix()}▶ 第 {index + 1}/{len(values)} 组：设定参数 = {value}"
+        )
         return True
 
 
@@ -3623,7 +4468,7 @@ class LaserFindNearestSetting(CustomRecognition):
 #   · 读数异常后的自动重测同样受益：重测一次约 4 秒（旧版 9 秒）
 #
 # ⚠️ 采样失败不会让整轮失败：一次没认到数字就跳过这次，窗到点就把已采到的取平均；
-#    一次都没采到才判这一轮识别失败，交给流水线的 on_error 写空值占位。
+#    一次都没采到才判这一轮识别失败，交给流水线的 on_error（默认保留本组上次读数，否则写空值占位）。
 # --------------------------------------------------------------------------- #
 class _Reading(NamedTuple):
     """一次读数的结果：数值 + 它在图上的位置 + 它是被哪条规则找到的。"""
@@ -4667,6 +5512,8 @@ class LaserSweepGuard(CustomAction):
         param = _resolve_guard_param(raw)
         node = str(getattr(argv, "node_name", "") or "LaserSweepGuard")
         record_node = param["record_node"]
+        # 两段扫描（先正后反 / 先反后正）时给日志加段标记，组号才不会被误读成总进度
+        phase_prefix = _phase_log_prefix()
 
         # ── 出口一：校验被关掉 ────────────────────────────────────────────
         # 排查「是不是守卫误判」时用。关掉之后行为和旧版完全一致，
@@ -4678,8 +5525,8 @@ class LaserSweepGuard(CustomAction):
 
         # ── 出口一（同上）：没读到值 ──────────────────────────────────────
         # 识别失败由流水线的 on_error → LaserSweepRecordFailed 处理，轮不到这一层。
-        # 真走到这里说明识别"成功"了却没有值，属于状态异常，交给 Record 写空值占位
-        # 比在这里自作主张更安全 —— 保护层绝不能制造新的故障点。
+        # 真走到这里说明识别"成功"了却没有值，属于状态异常，交给 Record 节点
+        # （有值就记，没值按空值处理）比在这里自作主张更安全 —— 保护层绝不能制造新的故障点。
         measured = _state.get("measured")
         if measured is None:
             context.override_next(node, [record_node])
@@ -4742,7 +5589,7 @@ class LaserSweepGuard(CustomAction):
             history.append(current)
             context.override_next(node, [record_node])
             print(
-                f"[laser_sweep] 第 {index + 1}/{total} 组（设定 {set_value}）"
+                f"[laser_sweep] {phase_prefix}第 {index + 1}/{total} 组（设定 {set_value}）"
                 f"首个读数 {_fmt(current)}，作为基准，先记录"
             )
             return True
@@ -4769,7 +5616,7 @@ class LaserSweepGuard(CustomAction):
             history.append(current)
             context.override_next(node, [record_node])
             print(
-                f"[laser_sweep] ✅ 第 {index + 1}/{total} 组（设定 {set_value}）读数正常："
+                f"[laser_sweep] {phase_prefix}✅ 第 {index + 1}/{total} 组（设定 {set_value}）读数正常："
                 f"{describe()}"
             )
             return True
@@ -4814,7 +5661,7 @@ class LaserSweepGuard(CustomAction):
         ):
             newest = float(abnormal[-1])
             print(
-                f"[laser_sweep] ⚠️ 第 {index + 1}/{total} 组（设定 {set_value}）"
+                f"[laser_sweep] {phase_prefix}⚠️ 第 {index + 1}/{total} 组（设定 {set_value}）"
                 f"连续 {strikes} 次读数都偏离基准，但它们彼此一致"
                 f"（跨度 {_fmt(max(recent) - min(recent))}）"
             )
@@ -4848,7 +5695,8 @@ class LaserSweepGuard(CustomAction):
                 jumped = []
                 _state["jumps"] = jumped
             jumped.append({"index": index + 1, "set": set_value, "value": newest,
-                           "from": reference, "strikes": strikes})
+                           "from": reference, "strikes": strikes,
+                           "phase": int(_state.get("phase_index") or 0)})
             context.override_next(node, [record_node])
             return True
 
@@ -4877,7 +5725,7 @@ class LaserSweepGuard(CustomAction):
 
             context.override_next(node, [retry_node])
             print(
-                f"[laser_sweep] ⚠️ 第 {index + 1}/{total} 组（设定 {set_value}）读数异常"
+                f"[laser_sweep] {phase_prefix}⚠️ 第 {index + 1}/{total} 组（设定 {set_value}）读数异常"
                 f"（第 {strikes}/{param['retry_max']} 次）：{describe()} → {wait_text}"
             )
             return True
@@ -4891,9 +5739,13 @@ class LaserSweepGuard(CustomAction):
         #   False → 走原来的终止节点（旧行为，界面上可以选回去）
         # 两种都会留下告警邮件，区别只在要不要把扫描停在半路。
         continue_on_abnormal = bool(param.get("continue_on_abnormal", DEFAULT_CONTINUE_ON_ABNORMAL))
+        # 判废的这一组要不要保留最后一次异常读数（2026-10-29 新增，默认保留）：
+        #   True  → CSV 写最后读到的数值 + 备注「保留读数」，画图曲线不缺这个点；
+        #   False → 老行为，写空值占位。
+        keep_abnormal = bool(param.get("keep_abnormal", DEFAULT_KEEP_ABNORMAL))
         tail = "继续扫描下一个点" if continue_on_abnormal else "准备终止扫描"
         print(
-            f"[laser_sweep] ❌ 第 {index + 1}/{total} 组（设定 {set_value}）"
+            f"[laser_sweep] {phase_prefix}❌ 第 {index + 1}/{total} 组（设定 {set_value}）"
             f"连续 {strikes} 次读数异常，达到上限 {param['retry_max']}，{tail}"
         )
         print(f"[laser_sweep]   {describe()}")
@@ -4912,6 +5764,8 @@ class LaserSweepGuard(CustomAction):
             started_at=str(_state.get("started_at") or ""),
             retry_max=param["retry_max"],
             continuing=continue_on_abnormal,
+            keeping=keep_abnormal,
+            phase_text=_phase_plan_text(),
         )
         info["guard"] = {
             "strikes": strikes,
@@ -4923,6 +5777,7 @@ class LaserSweepGuard(CustomAction):
         info["index"] = index
         info["set_value"] = set_value
         info["continue_on_abnormal"] = continue_on_abnormal
+        info["keep_abnormal"] = keep_abnormal
 
         # 主任务里的「读数异常发送邮件」开关关掉时，就只写日志、不发信。
         # 注意这里**不是**静默跳过：日志里要明确说「已按设置不发」，否则
@@ -4961,22 +5816,34 @@ class LaserSweepGuard(CustomAction):
         _state["alert"] = info
 
         if continue_on_abnormal:
-            # ── 继续：这一组记空值，跳到下一个参数点 ────────────────────
+            # ── 继续：这一组写一行结果，跳到下一个参数点 ─────────────────
             # 为什么要在这里就写 CSV，而不是交给 LaserSweepRecord：
-            #   Guard 的出口是三选一，而要"补一行空值"这一次不能再经过 Record，
+            #   Guard 的出口是三选一，而这一行结果不能再经过 Record，
             #   否则会写两行（2026-10-27 实测事故：第 176/177 行各写了两次，
             #   CSV 从 201 行变成 203 行，事后核对行号与设定参数全对不上）。
             #   而「行号必须与设定参数一一对应」是本项目的硬约定（事后翻表才能
-            #   看出第几组废了），所以必须就地补一行，然后**跳过 Record 直接推进**。
-            _state["last_note"] = f"连续{strikes}次异常，按设置继续扫描"
+            #   看出第几组废了），所以必须就地写一行，然后**跳过 Record 直接推进**。
             measured_before = _state.get("measured")
-            _state["measured"] = None  # Record 节点靠它，这里也顺手对齐
-            written = _append_row(None)
-            if measured_before is not None:
-                print(f"[laser_sweep]   本组读数 {_fmt(float(measured_before))} 已判废，"
-                      "CSV 写空值占位；原值保留在告警邮件里")
+            value_to_write: Optional[float] = None
+            if keep_abnormal and measured_before is not None:
+                value_to_write = float(measured_before)
+            if value_to_write is not None:
+                _state["last_note"] = f"连续{strikes}次异常，保留读数"
+                _state["measured"] = None  # Record 节点靠它，这里也顺手对齐
+                written = _append_row(value_to_write, note=f"连续{strikes}次异常，保留读数")
+                print(
+                    f"[laser_sweep]   本组读数 {_fmt(value_to_write)} 已判废，"
+                    "CSV 保留最后读数（备注已标记）；可按设置关闭「保留异常读数」改回空值"
+                )
+            else:
+                _state["last_note"] = f"连续{strikes}次异常，按设置继续扫描"
+                _state["measured"] = None  # Record 节点靠它，这里也顺手对齐
+                written = _append_row(None)
+                if measured_before is not None:
+                    print(f"[laser_sweep]   本组读数 {_fmt(float(measured_before))} 已判废，"
+                          "CSV 写空值占位；原值保留在告警邮件里")
             if not written:
-                print("[laser_sweep]   ⚠️ 空值占位没写进去，行号可能与参数错位")
+                print("[laser_sweep]   ⚠️ 本组结果没写进 CSV，行号可能与参数错位")
 
             # 清掉本轮状态，让下一个点从干净的基准开始 ——
             # 不清的话，下一个点的读数会继续拿这个坏点当基准，连锁误判。
@@ -4992,7 +5859,9 @@ class LaserSweepGuard(CustomAction):
             advance_node = str(param.get("advance_node") or DEFAULT_ADVANCE_NODE)
             print(
                 f"[laser_sweep] → 按设置继续扫描下一个点"
-                f"（可在「扫描设置」里改成出现异常就停止）；空值行已写，跳过 Record 直接推进"
+                f"（可在「扫描设置」里改成出现异常就停止）；"
+                + ("本组读数已保留写入，" if keep_abnormal and measured_before is not None else "空值行已写，")
+                + "跳过 Record 直接推进"
             )
             context.override_next(node, [advance_node])
             return True
@@ -5003,7 +5872,7 @@ class LaserSweepGuard(CustomAction):
 
 
 # --------------------------------------------------------------------------- #
-# ④c 连续异常终止：写空值占位 + 摘要 + 停止整个任务
+# ④c 连续异常终止：落一行结果（默认保留最后读数）+ 摘要 + 停止整个任务
 # --------------------------------------------------------------------------- #
 @AgentServer.custom_action("laser_sweep_abnormal_stop")
 class LaserSweepAbnormalStop(CustomAction):
@@ -5021,6 +5890,11 @@ class LaserSweepAbnormalStop(CustomAction):
         retry_max = int(_number(param.get("retry_max"), guard_state.get("retry_max", DEFAULT_RETRY_MAX)))
         if retry_max < 1:
             retry_max = DEFAULT_RETRY_MAX
+        # 与 Guard 同一个开关：判废的这一组是否保留最后读数（默认保留）。
+        keep_abnormal = _flag(
+            param.get("keep_abnormal"),
+            bool(guard_state.get("keep_abnormal", DEFAULT_KEEP_ABNORMAL)),
+        )
 
         alert = _state.get("alert") if isinstance(_state.get("alert"), dict) else {}
         guard = _state.get("guard") if isinstance(_state.get("guard"), dict) else {}
@@ -5036,28 +5910,44 @@ class LaserSweepAbnormalStop(CustomAction):
         set_value = values[index] if 0 <= index < total else "?"
         csv_path = _state.get("csv_path")
 
-        print("[laser_sweep] ✗ 读数连续异常，扫描在" f"第 {min(index + 1, total) if total else index + 1}/{total} 组终止")
+        phase_text = _phase_plan_text()
+        phase_note = f"{phase_text} " if phase_text else ""
+        print(
+            "[laser_sweep] ✗ 读数连续异常，扫描在"
+            f"{phase_note}第 {min(index + 1, total) if total else index + 1}/{total} 组终止"
+        )
 
-        # ① 当前这组写空值占位：保证 CSV 行号与参数序列一一对应 ——
-        #    这样事后翻表能明确看出「第 7 组是空的 = 那组读数出了问题」，
-        #    而不是行错位、把后面的值全对应错。
-        _state["last_note"] = f"连续{strikes}次异常，已停止扫描"
+        # ① 当前这组落一行结果：保证 CSV 行号与参数序列一一对应 ——
+        #    默认保留最后读到的异常值（备注列标记），曲线不会缺点；
+        #    关掉「保留异常读数」时写空值占位，事后一眼能看出哪组废了。
         measured_before = _state.get("measured")
-        # 这一组不写"可疑的读数"，只写空值；原值留在日志和告警里备查。
-        # _append_row 读的就是 _state["measured"]，所以这里临时置空、写完立刻还原，
-        # 免得把"上一组的实测值"从状态里抹掉（收尾/告警还要用它）。
-        _state["measured"] = None
-        wrote = _append_row(None)
-        _state["measured"] = measured_before
+        value_to_write: Optional[float] = None
+        if keep_abnormal and measured_before is not None:
+            value_to_write = float(measured_before)
+        if value_to_write is not None:
+            _state["last_note"] = f"连续{strikes}次异常，已停止（保留读数）"
+            _state["measured"] = None  # Record 节点靠它，这里也顺手对齐
+            wrote = _append_row(
+                value_to_write, note=f"连续{strikes}次异常，已停止（保留读数）"
+            )
+            _state["measured"] = measured_before
+            print(f"[laser_sweep]   本组读数 {_fmt(value_to_write)} 已判废，CSV 保留最后读数")
+        else:
+            _state["last_note"] = f"连续{strikes}次异常，已停止扫描"
+            # _append_row 读的就是 _state["measured"]，所以这里临时置空、写完立刻还原，
+            # 免得把"上一组的实测值"从状态里抹掉（收尾/告警还要用它）。
+            _state["measured"] = None
+            wrote = _append_row(None)
+            _state["measured"] = measured_before
         if not wrote:
-            print("[laser_sweep]   ⚠️ 空值占位没写进 CSV（详见上面的原因），请手工核对行数")
+            print("[laser_sweep]   ⚠️ 本组结果没写进 CSV（详见上面的原因），请手工核对行数")
 
         # ② 终止摘要
         elapsed = _elapsed_seconds()
         print("[laser_sweep] ── 终止摘要 ──────────────────────────────")
         print(
-            f"[laser_sweep]   进度：第 {min(index + 1, total) if total else index + 1}/{total} 组"
-            f"（设定参数 {set_value}，已完成 {min(index, total)} 组）"
+            f"[laser_sweep]   进度：{phase_note}第 {min(index + 1, total) if total else index + 1}/{total} 组"
+            f"（设定参数 {set_value}，已完成 {min(index, total)} 组；本次计划共 {_planned_total()} 组）"
         )
         print(f"[laser_sweep]   总耗时：{_fmt_elapsed(elapsed)}")
         if abnormal:
@@ -5079,7 +5969,10 @@ class LaserSweepAbnormalStop(CustomAction):
         else:
             print("[laser_sweep]   通知：未经过守卫（没有告警内容可发）")
         print(f"[laser_sweep]   结果文件：{csv_path}")
-        print("[laser_sweep]   已按空值占位写入当前组，行号与参数序列保持一致")
+        if keep_abnormal and measured_before is not None:
+            print(f"[laser_sweep]   已保留最后读数 {_fmt(float(measured_before))} 写入当前组，行号与参数序列保持一致")
+        else:
+            print("[laser_sweep]   已按空值占位写入当前组，行号与参数序列保持一致")
 
         # ③ 停整个任务
         print("[laser_sweep] 扫描已终止")
@@ -5124,36 +6017,81 @@ def _compose_summary(
     和告警信的区别：告警信是「出事了，快来看」；这封是「跑完了，看一眼就行」。
     所以正文以**结果摘要**为主：扫了多少组、成功几组、有没有空值行、耗时多久。
     它读的是 _state 里那次扫描留下的记录 —— 扫描任务的收尾节点会把这些填好。
+
+    2026-10-30：一次扫描可能有两段方向、两份 CSV，摘要逐份统计并列出，
+    跳变/空值行也会标明出自哪一段（正反两段的组号都从 1 开始，不带段号会混）。
     """
+    phases = [p for p in (state.get("phases") or []) if isinstance(p, dict)]
     values = list(state.get("values") or [])
-    total = len(values)
-    csv_path = state.get("csv_path")
+    planned_total = sum(len(p.get("values") or []) for p in phases) if phases else len(values)
+
+    csv_paths: list[Path] = []
+    for item in state.get("csv_paths") or []:
+        if item is not None:
+            csv_paths.append(Path(item))
+    if not csv_paths:
+        csv_path = state.get("csv_path")
+        if csv_path is not None:
+            csv_paths = [Path(csv_path)]
     out_root = state.get("out_root")
     elapsed = _elapsed_seconds()
     alert = state.get("alert") or {}
 
     # 尝试从 CSV 里统计真实写入的行数：比只看 _state 可靠，
     # 因为它反映的是「真的落盘了什么」，而不是「程序觉得该写什么」。
-    rows: list[list[str]] = []
-    try:
-        if csv_path is not None and Path(csv_path).is_file():
-            with Path(csv_path).open("r", newline="", encoding="utf-8-sig") as f:
-                rows = [row for row in csv.reader(f) if row]
-    except OSError as exc:
-        print(f"[laser_sweep]   ⚠️ 读结果文件失败，跳过行数统计：{exc}")
+    # 两段扫描要逐份读，才能在摘要里分别报出每段的进度。
+    file_rows: list[list[list[str]]] = []
+    for csv_path in csv_paths:
+        rows: list[list[str]] = []
+        try:
+            if csv_path.is_file():
+                with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
+                    rows = [row for row in csv.reader(f) if row]
+        except OSError as exc:
+            print(f"[laser_sweep]   ⚠️ 读结果文件失败，跳过行数统计：{exc}")
+        file_rows.append(rows[1:] if rows else [])
 
-    data_rows = rows[1:] if rows else []
-    recorded = len(data_rows)
-    empty_rows = [r for r in data_rows if len(r) > 2 and not str(r[2]).strip()]
+    # 带「哪一段」标记的行，便于在摘要里精确定位（单段时标记为空）
+    labeled_rows: list[tuple[int, list[str]]] = []
+    for file_index, rows in enumerate(file_rows):
+        for row in rows:
+            labeled_rows.append((file_index, row))
+
+    recorded = len(labeled_rows)
+    empty_rows = [
+        (file_index, r)
+        for file_index, r in labeled_rows
+        if len(r) > 2 and not str(r[2]).strip()
+    ]
+    # 「异常保留」行：有数值、但备注写着保留读数 / 保留本组上次读数。
+    # 它们算有效数据（能画进曲线），但需要和常规读数分开报出来。
+    kept_abnormal_rows = [
+        (file_index, r)
+        for file_index, r in labeled_rows
+        if len(r) > 4
+        and str(r[2]).strip()
+        and ("保留读数" in str(r[4]) or "保留本组上次读数" in str(r[4]))
+    ]
     filled = recorded - len(empty_rows)
 
-    if total and not recorded:
-        progress = f"计划 {total} 组，结果文件里还没有数据行"
-    elif total:
-        progress = f"计划 {total} 组，已记录 {recorded} 行（有效 {filled} 行"
+    if planned_total and not recorded:
+        progress = f"计划 {planned_total} 组，结果文件里还没有数据行"
+    elif planned_total:
+        progress = f"计划 {planned_total} 组，已记录 {recorded} 行（有效 {filled} 行"
+        if kept_abnormal_rows:
+            progress += f"，其中异常保留 {len(kept_abnormal_rows)} 行"
         progress += f"，空值 {len(empty_rows)} 行）" if empty_rows else "）"
     else:
         progress = f"结果文件里记录了 {recorded} 行"
+
+    multi_file = len(csv_paths) > 1
+
+    def row_refs(items: list[tuple[int, list[str]]]) -> str:
+        parts = []
+        for file_index, row in items[:10]:
+            prefix = f"第{file_index + 1}段 " if multi_file else ""
+            parts.append(prefix + str(row[0] if row else ""))
+        return "、".join(parts) + ("…" if len(items) > 10 else "")
 
     subject = f"任务完成：{progress}"
     if alert.get("ok") is False and alert:
@@ -5166,15 +6104,46 @@ def _compose_summary(
         "【结果】",
         f"  {progress}",
     ]
-    if values:
-        body_lines.append(f"  参数区间：{values[0]} → {values[-1]}")
-    if empty_rows:
+    if state.get("direction_label"):
+        body_lines.append(f"  扫描方向：{state.get('direction_label')}")
+    # 只列**已经开始**的段的参数区间：如果第二段建文件失败/中止，
+    # 不能把一段根本没跑的「参数区间（反向）」写进摘要。
+    started_phases = [p for p in phases if p.get("started")]
+    unstarted_phases = [
+        (index, p) for index, p in enumerate(phases) if not p.get("started")
+    ]
+    if len(started_phases) <= 1:
+        if values:
+            body_lines.append(f"  参数区间：{values[0]} → {values[-1]}")
+    else:
+        for phase in started_phases:
+            items = list(phase.get("values") or [])
+            if items:
+                body_lines.append(
+                    f"  参数区间（{phase.get('label') or ''}）：{items[0]} → {items[-1]}"
+                )
+    if unstarted_phases:
+        phase_failed = state.get("phase_failed")
+        reason = ""
+        if isinstance(phase_failed, dict) and phase_failed.get("reason"):
+            reason = f"；原因：{phase_failed.get('reason')}"
         body_lines.append(
-            "  空值行位置："
-            + "、".join(str(r[0]) for r in empty_rows[:10] if r)
-            + ("…" if len(empty_rows) > 10 else "")
+            "  未开始的段："
+            + "、".join(
+                f"第 {index + 1} 段（{phase.get('label') or ''}）"
+                for index, phase in unstarted_phases
+            )
+            + f"（本次未执行，没有生成结果文件{reason}）"
         )
+    if empty_rows:
+        body_lines.append("  空值行位置：" + row_refs(empty_rows))
         body_lines.append("  （空值 = 该组读数失败或异常被拦下，行号仍与设定参数一一对应）")
+    if kept_abnormal_rows:
+        body_lines.append("  异常保留行位置：" + row_refs(kept_abnormal_rows))
+        body_lines.append(
+            "  （异常保留 = 该组读数被判异常，按「保留异常读数」设置保留了最后读数；"
+            "已在 CSV 备注列标记）"
+        )
 
     # ── 跳变留痕（2026-10-27 审查要求）──────────────────────────────────
     # 为什么必须写进摘要：这类行**是有效数据**，但可信度低于普通读数 ——
@@ -5190,9 +6159,15 @@ def _compose_summary(
             "因彼此一致而被接受（不是常规读数）"
         )
         for item in jumps[:10]:
+            phase_index = int(item.get("phase") or 0)
+            phase_label = ""
+            if 0 <= phase_index < len(phases):
+                phase_label = str(phases[phase_index].get("label") or "")
+            prefix = f"第 {phase_index + 1} 段（{phase_label}）" if multi_file else ""
             body_lines.append(
-                "    第 %s 组 设定 %s：%s → %s"
+                "    %s第 %s 组 设定 %s：%s → %s"
                 % (
+                    prefix,
                     item.get("index"),
                     item.get("set"),
                     _fmt(float(item.get("from") or 0)),
@@ -5211,7 +6186,20 @@ def _compose_summary(
     ]
 
     body_lines += ["", "【文件】"]
-    body_lines.append(f"  结果文件：{csv_path if csv_path else '(本次没有生成)'}")
+    if not csv_paths:
+        body_lines.append("  结果文件：(本次没有生成)")
+    elif not multi_file:
+        body_lines.append(f"  结果文件：{csv_paths[0]}")
+    else:
+        for index, csv_path in enumerate(csv_paths):
+            label = ""
+            if index < len(phases):
+                label = str(phases[index].get("label") or "")
+            rows_count = len(file_rows[index]) if index < len(file_rows) else 0
+            body_lines.append(
+                f"  第 {index + 1} 段" + (f"（{label}）" if label else "")
+                + f"：{csv_path}（{rows_count} 行数据）"
+            )
     if out_root:
         body_lines.append(f"  输出目录：{out_root}")
 
@@ -5363,9 +6351,32 @@ class LaserSweepRecord(CustomAction):
 
 @AgentServer.custom_action("laser_sweep_record_failed")
 class LaserSweepRecordFailed(CustomAction):
+    """识别失败（OCR 没读到数）时的那一行。
+
+    这里要区分两种失败：
+      · 本组之前读到过数（比如重测途中这一次 OCR 失败）→ 默认保留那个数，
+        曲线不缺这个点；备注写「读数失败，保留本组上次读数」。
+      · 本组一个数都没读到过（_state["measured"] is None）→ 没有可保留的值，
+        仍然写空值占位，保证行号与参数一一对应。
+    关掉「保留异常读数」时，一律退回空值占位（老行为）。
+    """
+
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        param = _param(argv.custom_action_param)
+        guard_state = _state.get("guard_param") if isinstance(_state.get("guard_param"), dict) else {}
+        keep_abnormal = _flag(
+            param.get("keep_abnormal"),
+            bool(guard_state.get("keep_abnormal", DEFAULT_KEEP_ABNORMAL)),
+        )
+        measured = _state.get("measured")
+        if keep_abnormal and measured is not None:
+            print(
+                f"[laser_sweep]   本轮读数失败，保留本组上一次读到的 {_fmt(float(measured))}"
+                "（备注列已标记）"
+            )
+            return _append_row(float(measured), note="读数失败，保留本组上次读数")
         print("[laser_sweep]   本轮读数失败，写入空值占位以保证行数对齐")
-        return _append_row(None)
+        return _append_row(None, note="读数失败")
 
 
 # --------------------------------------------------------------------------- #
@@ -5375,14 +6386,35 @@ class LaserSweepRecordFailed(CustomAction):
 class LaserSweepAdvance(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
         param = _param(argv.custom_action_param)
-        _state["index"] += 1
-        total = len(_state["values"])
+        _state["index"] = int(_state.get("index") or 0) + 1
+        total = len(_state.get("values") or [])
 
         if _state["index"] >= total:
+            # 2026-10-30：先看还有没有下一段（先正后反 / 先反后正）。
+            # 有就切段并继续回到 ApplyParam —— 本节点的默认 next 就是它，
+            # 不需要改道；没有才去收尾。
+            if _start_next_phase():
+                return True
             done_node = str(param.get("done_node") or "LaserSweepDone")
             # 把本节点的 next 改写成收尾节点，循环就此结束
             context.override_next(argv.node_name, [done_node])
-            print(f"[laser_sweep] 已完成全部 {total} 组扫描")
+            failed = _state.get("phase_failed")
+            if isinstance(failed, dict):
+                # 下一段没开起来（建文件失败/路径无效）：别说成"全部完成"。
+                # 计划 N 组，实际只跑完了已开始的段；未开始的那份结果文件不存在。
+                print(
+                    f"[laser_sweep] ⚠️ 第 {int(failed.get('index') or 0) + 1} 段"
+                    f"（{failed.get('label') or ''}）没能开始：{failed.get('reason') or '未知原因'}"
+                )
+                print(
+                    f"[laser_sweep]   扫描提前收尾：已完成 {_completed_total()} 组 / 计划 {_planned_total()} 组，"
+                    f"已生成 {len(_state.get('csv_paths') or [])} 份结果文件（已跑完的数据不受影响）"
+                )
+            else:
+                print(
+                    f"[laser_sweep] 已完成全部 {_planned_total()} 组扫描"
+                    f"（{len(_state.get('csv_paths') or [])} 份结果文件）"
+                )
 
         return True
 
@@ -5392,7 +6424,24 @@ class LaserSweepFinish(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
         param = _param(argv.custom_action_param)
         csv_path = _state.get("csv_path")
-        print(f"[laser_sweep] 扫描结束，结果文件：{csv_path}")
+        paths = [Path(p) for p in (_state.get("csv_paths") or []) if p is not None]
+        if not paths and csv_path is not None:
+            paths = [Path(csv_path)]
+        phases = [p for p in (_state.get("phases") or []) if isinstance(p, dict)]
+
+        if len(paths) <= 1:
+            print(f"[laser_sweep] 扫描结束，结果文件：{csv_path}")
+        else:
+            print(
+                f"[laser_sweep] 扫描结束（方向：{_state.get('direction_label') or '正向'}），"
+                f"共 {len(paths)} 份结果文件："
+            )
+            for index, path in enumerate(paths):
+                label = phases[index].get("label") if index < len(phases) else ""
+                prefix = f"第 {index + 1} 段" + (f"（{label}）" if label else "")
+                rows = _csv_data_row_count(path)
+                suffix = f"（{rows} 行数据）" + ("〔只有表头，未写入数据〕" if rows == 0 else "")
+                print(f"[laser_sweep]   {prefix}：{path}{suffix}")
 
         # 跑完自动打开 output 总目录（UI 上可以关掉）。
         # 折叠分组的设置由 begin 从任务配置读到 _state；优先用它，避免折叠时
@@ -5445,7 +6494,7 @@ class LaserSweepOpenOutput(CustomAction):
 
 
 # --------------------------------------------------------------------------- #
-# ④e 独立的「绘制曲线图」任务（2026-10-28 新增）
+# ④e 独立的「绘制曲线图」任务（2026-10-28 新增；2026-10-30 支持正反两份）
 #
 # 为什么是独立任务：
 #   主人要求「该功能需要独立于主要任务」。绘图是**事后消费**结果的动作，
@@ -5453,17 +6502,138 @@ class LaserSweepOpenOutput(CustomAction):
 #   把绘图挂到扫描收尾会让「主任务失败 = 图也出不来」，而实际上只要 CSV 还在，
 #   随时都可以重新画。
 #
-# 默认画哪一份 CSV（主人要求「默认选择最近导出的单个 CSV」）：
-#   ① 同一个 agent 进程里刚跑完扫描 → _state["csv_path"]；
-#   ② 否则读 laser_sweep_output.json 里的 last_csv（扫描 begin 时写的）；
-#   ③ 再否则在 output 总目录里找修改时间最新的一个 .csv。
-#   用户也可以在「绘图设置」里填一个具体 CSV（或目录，取目录里最新的）。
+# 默认画哪些 CSV：
+#   ① 同一个 agent 进程里刚跑完扫描 → _state["csv_paths"]（一份或两份）；
+#   ② 否则读 laser_sweep_output.json 里的 csv_paths（兼容老文件的 last_csv）；
+#   ③ 再否则在 output 总目录里找修改时间最新的一个 .csv，并按方向标记
+#      把它和「同一轮的另一份」配成一对（先正后反 / 先反后正 出的两份都画）。
+#   用户也可以在「绘图设置」里填一个具体 CSV（只画它），或填目录（取目录里
+#   最新的 CSV，同样按方向标记配对）。
 # --------------------------------------------------------------------------- #
-def _resolve_plot_csv(param: dict[str, Any]) -> Optional[Path]:
-    """决定「绘制曲线图」任务要画哪一份 CSV。
+def _existing_paths(paths: Any) -> list[Path]:
+    """过滤出磁盘上真实存在的 CSV（保持顺序、去重）。"""
+    result: list[Path] = []
+    seen: set[str] = set()
+    if not isinstance(paths, (list, tuple)):
+        return result
+    for item in paths:
+        if item is None:
+            continue
+        path = Path(item)
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if path.is_file():
+                result.append(path)
+        except OSError:
+            continue
+    return result
 
-    返回 None 表示找不到；调用方打印的日志已经说明了该去哪里补。
+
+def _plot_ready(paths: list[Path]) -> list[Path]:
+    """去掉只写了表头、还没有数据行的 CSV（例如刚建好第二段就中止）。
+
+    如果全都还没有数据，就原样返回 —— 让绘图动作自己打出「CSV 里没有
+    可绘制的数据行」这种明确报错，而不是在这里静默返回空列表。
+
+    ⚠️ 这个函数只是「优化」：数不清行数（编码/权限/文件变化）时必须
+    把原路径交给绘图动作处理，绝不能在这里抛异常 —— 否则一个好端端的
+    GBK CSV 会因为选文件阶段崩掉，而直接填它的路径却能正常画。
     """
+    ready: list[Path] = []
+    for path in paths:
+        try:
+            if _csv_plot_point_count(path) > 0:
+                ready.append(path)
+            else:
+                print(f"[laser_sweep]   跳过没有可绘制数据点的 CSV：{Path(path).name}")
+        except Exception:  # noqa: BLE001 - 兜底层：读不了就交给绘图动作报错
+            ready.append(path)
+    return ready if ready else list(paths)
+
+
+def _scan_direction_pair_in_dir(latest: Path, base: str) -> list[Path]:
+    """在同一目录里按「基础名 + _正向/_反向」找配对文件。"""
+    try:
+        entries = list(latest.parent.iterdir())
+    except OSError:
+        return [latest]
+
+    found: list[tuple[str, Path]] = []
+    for entry in entries:
+        try:
+            if not entry.is_file() or entry.suffix.lower() != ".csv":
+                continue
+        except OSError:
+            continue
+        entry_base, entry_code = _split_direction_marker(entry.stem)
+        if entry_base == base and entry_code is not None:
+            found.append((entry_code, entry))
+    if not found:
+        return [latest]
+
+    # 固定成「先正向、再反向」的顺序，日志和打开图片的顺序才稳定
+    order = {DIRECTION_FORWARD: 0, DIRECTION_REVERSE: 1}
+    found.sort(key=lambda item: (order.get(item[0], 9), str(item[1]).lower()))
+    return [path for _code, path in found]
+
+
+def _csv_pair_by_marker(latest: Path) -> list[Path]:
+    """给一份带方向标记的 CSV，找出「同一轮的另一份」，返回要一起画的列表。
+
+    配对来源分两种（2026-10-30 审查发现「固定文件名会跨轮配对」后补强）：
+
+      ① 状态文件 laser_sweep_output.json 里记录了本轮 csv_paths：
+         以记录为**唯一权威**，绝不再从目录里捞别的轮次；
+      ② 没有状态记录（程序重启 / 状态文件丢失）：只对**基础名里带
+         YYYYMMDD_HHMMSS 时间戳**的文件按目录配对。
+
+    为什么 ② 要限制时间戳：用户把「结果文件名」固定成「结果」这类不含
+    时间戳的名字时，两次扫描可能共用同一个名字 —— 按目录配对会把 A 轮的
+    「结果_正向」和 B 轮的「结果_反向」配成一对，画出来是两轮不同的数据。
+    这时只画最新一份，宁少不错。
+
+    不带方向标记的老 CSV（v1.0.22 及以前）只画它自己，保持旧行为。
+    """
+    latest = Path(latest)
+    base, code = _split_direction_marker(latest.stem)
+    if code is None:
+        return [latest]
+
+    # ① 状态文件里记录过本轮文件：以记录为准
+    recorded = _existing_paths(_recall_csv_paths())
+    if latest in recorded:
+        same_run = [
+            path
+            for path in recorded
+            if path.parent == latest.parent
+            and _split_direction_marker(path.stem)[0] == base
+        ]
+        if same_run:
+            order = {DIRECTION_FORWARD: 0, DIRECTION_REVERSE: 1}
+            same_run.sort(
+                key=lambda path: (
+                    order.get(_split_direction_marker(path.stem)[1], 9),
+                    str(path).lower(),
+                )
+            )
+            return same_run
+        return [latest]
+
+    # ② 没有状态记录（或 latest 不在记录里）：只认带时间戳的基础名
+    if not re.search(r"\d{8}_\d{6}", base):
+        print(
+            "[laser_sweep]   文件名不含时间戳，无法确认「同一轮」，"
+            "只画最新这一份（避免把不同轮次的正/反文件配成对）"
+        )
+        return [latest]
+    return _scan_direction_pair_in_dir(latest, base)
+
+
+def _resolve_plot_csvs(param: dict[str, Any]) -> list[Path]:
+    """决定「绘制曲线图」任务要画哪几份 CSV（返回空列表 = 找不到）。"""
     raw = str(param.get("source_csv") or "").strip().strip('"').strip("'")
     if raw:
         target = _resolve(raw)
@@ -5473,28 +6643,47 @@ def _resolve_plot_csv(param: dict[str, Any]) -> Optional[Path]:
             latest = find_latest_csv(target)
             if latest is None:
                 print(f"[laser_sweep] 指定的目录里没找到任何 CSV：{target}")
-                return None
+                return []
+            picked = _plot_ready(_csv_pair_by_marker(latest))
             print(f"[laser_sweep] 指定的是目录，自动选里面最新的 CSV：{latest}")
-            return latest
-        if not target.is_file():
+            if len(picked) > 1:
+                print(
+                    "[laser_sweep]   发现同一轮的正/反两份 CSV，将一起绘制："
+                    + "、".join(path.name for path in picked)
+                )
+            return picked
+        try:
+            exists = target.is_file()
+        except OSError:
+            exists = False
+        if not exists:
             print(f"[laser_sweep] 指定的 CSV 不存在：{target}")
-            return None
+            return []
         print(f"[laser_sweep] 使用界面指定的 CSV：{target}")
-        return target
+        return [target]
 
-    # ① 本进程刚扫完（最准确：就是这次 begin 算出来的那个路径）
-    session_csv = _state.get("csv_path")
-    if isinstance(session_csv, Path) and session_csv.is_file():
-        print(f"[laser_sweep] 使用本次扫描的 CSV：{session_csv}")
-        return session_csv
+    # ① 本进程刚扫完（最准确：begin/advance 记录了本次的一份或两份 CSV）
+    session = _plot_ready(_existing_paths(_state.get("csv_paths") or []))
+    if not session:
+        single = _state.get("csv_path")
+        session = _plot_ready(_existing_paths([single])) if single is not None else []
+    if session:
+        print(
+            f"[laser_sweep] 使用本次扫描的 CSV（{len(session)} 份）："
+            + "、".join(path.name for path in session)
+        )
+        return session
 
-    # ② 落盘记录的上一次扫描
-    last_csv = _recall_last_csv()
-    if last_csv is not None and last_csv.is_file():
-        print(f"[laser_sweep] 使用上次扫描记录的 CSV：{last_csv}")
-        return last_csv
+    # ② 落盘记录的上一次扫描（老状态文件只有 last_csv，会自动兼容成一份）
+    recalled = _plot_ready(_existing_paths(_recall_csv_paths()))
+    if recalled:
+        print(
+            f"[laser_sweep] 使用上次扫描记录的 CSV（{len(recalled)} 份）："
+            + "、".join(path.name for path in recalled)
+        )
+        return recalled
 
-    # ③ 在可能的 output 总目录里找最新的 CSV
+    # ③ 在可能的 output 总目录里找最新的 CSV（并按方向标记配成一对）
     from plot_curve import find_latest_csv
 
     roots: list[Path] = []
@@ -5518,13 +6707,19 @@ def _resolve_plot_csv(param: dict[str, Any]) -> Optional[Path]:
         seen.add(key)
         latest = find_latest_csv(root)
         if latest is not None:
+            picked = _plot_ready(_csv_pair_by_marker(latest))
             print(f"[laser_sweep] 自动选择 output 目录里最新的 CSV：{latest}")
-            return latest
+            if len(picked) > 1:
+                print(
+                    "[laser_sweep]   发现同一轮的正/反两份 CSV，将一起绘制："
+                    + "、".join(path.name for path in picked)
+                )
+            return picked
 
     print("[laser_sweep] 找不到可绘制的 CSV：")
     print(f"[laser_sweep]   看过的目录：{'、'.join(str(p) for p in roots)}")
     print("[laser_sweep]   请先在「激光参数扫描」任务里跑一次，或在「绘图设置」里填写 CSV 路径")
-    return None
+    return []
 
 
 @AgentServer.custom_action("laser_sweep_plot_curve")
@@ -5534,14 +6729,21 @@ class LaserSweepPlotCurve(CustomAction):
     它完全不依赖扫描流程是否正在跑：只要磁盘上有一份扫描导出的 CSV 就能用。
     真正的绘图逻辑在 agent/plot_curve.py（纯 stdlib + Windows GDI+），
     这里只负责「选文件、调绘图、打日志、按需打开图片」。
+
+    2026-10-30 起：一次任务可能要画**两份** CSV（先正后反 / 先反后正）。
+    逐份画、逐份报错：一份失败不影响另一份，只要有一份成功任务就算成功。
     """
 
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
         param = _param(argv.custom_action_param)
         print("[laser_sweep] ── 绘制曲线图任务 ──")
 
-        csv_path = _resolve_plot_csv(param)
-        if csv_path is None:
+        try:
+            csv_paths = _resolve_plot_csvs(param)
+        except Exception as exc:  # noqa: BLE001 - 选文件失败也不能把 agent 带崩
+            print(f"[laser_sweep] ✗ 选择要绘制的 CSV 时出错：{type(exc).__name__}: {exc}")
+            return False
+        if not csv_paths:
             return False
 
         # 延迟导入：绘图模块缺失时只让这一个任务失败，不拖垮整个 agent
@@ -5553,60 +6755,111 @@ class LaserSweepPlotCurve(CustomAction):
             print("[laser_sweep]   热修复包需要包含 agent/plot_curve.py（和 laser_sweep.py 同目录）")
             return False
 
-        # 图片文件名：留空 = <CSV 文件名>_曲线.png；填了就照填的来（仍强制同目录）
+        # 图片文件名：留空 = <CSV 文件名>_曲线.png；填了就照填的来（仍强制同目录）。
+        # 画多份 CSV 时一份文件名没法命名两张图，所以这时忽略它、改用各自 CSV 名。
         image_name = str(param.get("image_name") or "").strip().strip('"').strip("'")
-        image_path: Optional[Path] = None
-        if image_name:
-            safe_name = _sanitize_name(_expand_time_format(image_name), "")
-            if not safe_name:
-                safe_name = f"{csv_path.stem}_曲线"
-            if not safe_name.lower().endswith(".png"):
-                safe_name += ".png"
-            image_path = csv_path.parent / safe_name
-
-        try:
-            stat = csv_path.stat()
+        multi = len(csv_paths) > 1
+        if multi and image_name:
             print(
-                f"[laser_sweep] CSV：{csv_path}"
-                f"（{stat.st_size} 字节，改于 {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}）"
+                "[laser_sweep] 提示：本次要画多份 CSV，界面填的「图片文件名」只对单份生效，"
+                "已按各自 CSV 名生成"
             )
-            result = plot_curve.plot_csv(csv_path, image_path)
-        except plot_curve.PlotError as exc:
-            print(f"[laser_sweep] ✗ 绘制失败：{exc}")
-            return False
-        except Exception as exc:  # noqa: BLE001 - 绘图任务不能把整个进程带崩
-            print(f"[laser_sweep] ✗ 绘制时出现意外错误：{type(exc).__name__}: {exc}")
-            return False
 
-        print(
-            f"[laser_sweep] 数据：X = 「{result['x_header']}」，Y = 「{result['y_header']}」，"
-            f"有效点 {result['points']} 个"
-            + (f"，跳过空值 {result['skipped']} 行" if result["skipped"] else "")
-        )
-        print(
-            f"[laser_sweep] 范围：温度 {_fmt(result['x_min'])} ~ {_fmt(result['x_max'])}，"
-            f"功率 {_fmt(result['y_min'])} ~ {_fmt(result['y_max'])}"
-        )
-        print(
-            f"[laser_sweep] ✅ 曲线图已保存：{result['image_path']}"
-            f"（{max(1, result['size'] // 1024)} KB）"
-        )
+        successes: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for csv_path in csv_paths:
+            image_path: Optional[Path] = None
+            if image_name and not multi:
+                safe_name = _sanitize_name(_expand_time_format(image_name), "")
+                if not safe_name:
+                    safe_name = f"{csv_path.stem}_曲线"
+                if not safe_name.lower().endswith(".png"):
+                    safe_name += ".png"
+                image_path = csv_path.parent / safe_name
+
+            _base, code = _split_direction_marker(csv_path.stem)
+            tag = f"（{DIRECTION_LABELS[code]}）" if code else ""
+            try:
+                stat = csv_path.stat()
+                print(
+                    f"[laser_sweep] CSV{tag}：{csv_path}"
+                    f"（{stat.st_size} 字节，改于 {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}）"
+                )
+                result = plot_curve.plot_csv(csv_path, image_path)
+            except plot_curve.PlotError as exc:
+                print(f"[laser_sweep] ✗ 绘制失败{tag}：{exc}")
+                failures.append(str(csv_path))
+                continue
+            except Exception as exc:  # noqa: BLE001 - 绘图任务不能把整个进程带崩
+                print(f"[laser_sweep] ✗ 绘制时出现意外错误{tag}：{type(exc).__name__}: {exc}")
+                failures.append(str(csv_path))
+                continue
+
+            print(
+                f"[laser_sweep] 数据：X = 「{result['x_header']}」，Y = 「{result['y_header']}」，"
+                f"有效点 {result['points']} 个"
+                + (f"，跳过空值 {result['skipped']} 行" if result["skipped"] else "")
+            )
+            print(
+                f"[laser_sweep] 范围：温度 {_fmt(result['x_min'])} ~ {_fmt(result['x_max'])}，"
+                f"功率 {_fmt(result['y_min'])} ~ {_fmt(result['y_max'])}"
+            )
+            print(
+                f"[laser_sweep] ✅ 曲线图已保存：{result['image_path']}"
+                f"（{max(1, result['size'] // 1024)} KB）"
+            )
+            successes.append(result)
+
+        if not successes:
+            print("[laser_sweep] ✗ 没有任何一份 CSV 绘制成功")
+            return False
+        if len(successes) > 1:
+            print(f"[laser_sweep] ✅ 本次共绘制 {len(successes)} 张曲线图（{len(successes)} 份 CSV）")
+        if failures:
+            print(
+                f"[laser_sweep] ⚠️ 有 {len(failures)} 份 CSV 绘制失败："
+                + "、".join(Path(p).name for p in failures)
+            )
 
         if _flag(param.get("open_when_done"), True):
-            if plot_curve.open_image(result["image_path"]):
+            opened = 0
+            for result in successes:
+                if plot_curve.open_image(result["image_path"]):
+                    opened += 1
+            if opened == len(successes):
                 print("[laser_sweep] 已用默认看图软件打开图片")
             else:
-                print("[laser_sweep] 提示：没能自动打开图片，请到上面的路径手动查看")
+                print("[laser_sweep] 提示：没能自动打开全部图片，请到上面的路径手动查看")
         return True
 
 
 @AgentServer.custom_action("laser_sweep_abort")
 class LaserSweepAbort(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
-        total = len(_state["values"])
+        values = _state.get("values") or []
+        total = len(values)
+        index = int(_state.get("index") or 0)
         print("[laser_sweep] ✗ 界面定位失败，扫描提前中止")
-        print(f"[laser_sweep]   进度：第 {min(_state['index'] + 1, total)}/{total} 组")
-        print(f"[laser_sweep]   已完成的数据已写入：{_state.get('csv_path')}")
+        phase_text = _phase_plan_text()
+        if phase_text:
+            print(
+                f"[laser_sweep]   进度：{phase_text} 第 {min(index + 1, total)}/{total} 组"
+                f"（本次计划共 {_planned_total()} 组）"
+            )
+        else:
+            print(f"[laser_sweep]   进度：第 {min(index + 1, total)}/{total} 组")
+        paths = [Path(p) for p in (_state.get("csv_paths") or []) if p is not None]
+        if not paths and _state.get("csv_path") is not None:
+            paths = [Path(_state["csv_path"])]
+        if not paths:
+            print("[laser_sweep]   已完成的数据已写入：(本次还没有开始写)")
+        for path in paths:
+            rows = _csv_data_row_count(path)
+            if rows > 0:
+                print(f"[laser_sweep]   已完成的数据已写入：{path}（{rows} 行）")
+            else:
+                # 第二段可能只建了表头就中止：别把它说成"已完成的数据"
+                print(f"[laser_sweep]   本段结果文件已创建、还没有数据行：{path}")
         print("[laser_sweep]   排查建议：先在 VS Code 里单独跑 LaserSweepFindTemperature，")
         print("[laser_sweep]   确认它能不能框到 Temperature 这个词。")
         return True

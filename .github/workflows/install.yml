@@ -4,8 +4,11 @@ env:
   # 版本控制：
   # - 设置 VERSION 为空字符串时，下载 latest 版本
   # - 设置 VERSION 为具体版本号时（如 v1.2.3），下载指定版本
-  MAAFW_VERSION: ""
-  MFAA_VERSION: ""
+  #
+  # 2026-11-03：固定到本次实测通过的版本。tag 构建必须可复现，
+  # 否则同一个 tag 在不同时间打出来的包可能用不同版本的框架。
+  MAAFW_VERSION: "v5.15.0"
+  MFAA_VERSION: "v2.16.4"
 
 on:
   push:

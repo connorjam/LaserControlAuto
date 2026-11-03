@@ -14,7 +14,7 @@
 
     python tools/fetch_binaries.py             # 最新版
     python tools/fetch_binaries.py --os win --arch x86_64
-    python tools/fetch_binaries.py --maa-tag v5.13.1 --mfa-tag v2.16.1
+    python tools/fetch_binaries.py --maa-tag v5.15.0 --mfa-tag v2.16.4
 
 ## 为什么不用 GitHub API
 

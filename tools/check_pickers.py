@@ -16,12 +16,17 @@ maa，直接调函数、拿真实日志里的坐标当样例比对：
     ④ anchor_text 同时兼容字符串和数组两种写法；
     ⑨ A 软件控件定位缓存：第一次 OCR 之后每轮直接复用，
        并且过期 / 窗口尺寸变化 / use_cache=false / relocate_every 四条失效路径都要走对
-       （这条是用假 Context 数 run_recognition 调用次数来验的，不连软件也能跑）。
+       （这条是用假 Context 数 run_recognition 调用次数来验的，不连软件也能跑）；
+    ⑪ 扫描方向（2026-10-30）：四种方向写法、正/反序列严格倒序、CSV 方向标记，
+       以及「先正后反」跑完第一段后真的会切到第二段、建第二份 CSV、组号回到 1。
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import sys
 import time
 import types
@@ -481,6 +486,567 @@ check("非整数点数：退回按步长而不是乱算",
       laser_sweep._resolve_count({"count": "2.5"}) == [])
 check("字符串形式的正整数照样认",
       laser_sweep._resolve_count({"count": "11"}) == [11])
+
+print()
+print("=" * 78)
+print("⑪ 扫描方向：四种方向、两段切换、CSV 方向标记（2026-10-30 新增）")
+print("=" * 78)
+
+# ── 方向解析：标准代码 / 中文 / 英文别名都要认 ─────────────────────────────
+check("正向：标准代码、中文、英文别名都认",
+      laser_sweep._normalize_direction("forward") == "forward"
+      and laser_sweep._normalize_direction("正向") == "forward"
+      and laser_sweep._normalize_direction("Ascending") == "forward"
+      and laser_sweep._normalize_direction("从小到大") == "forward")
+check("反向：标准代码、中文、英文别名都认",
+      laser_sweep._normalize_direction("reverse") == "reverse"
+      and laser_sweep._normalize_direction("反向") == "reverse"
+      and laser_sweep._normalize_direction("从大到小") == "reverse")
+check("两段方向也认中文与下划线写法",
+      laser_sweep._normalize_direction("先正后反") == "forward_reverse"
+      and laser_sweep._normalize_direction("先反后正") == "reverse_forward"
+      and laser_sweep._normalize_direction("forward_reverse") == "forward_reverse"
+      and laser_sweep._normalize_direction("Reverse-Forward") == "reverse_forward")
+check("空值 / 认不出的写法返回 None（由调用方决定兜底）",
+      laser_sweep._normalize_direction(None) is None
+      and laser_sweep._normalize_direction("") is None
+      and laser_sweep._normalize_direction("斜着扫") is None)
+
+# ── 方向 → 分段顺序 ────────────────────────────────────────────────────────
+check("正向 = 1 段（正向）", laser_sweep._direction_phases("forward") == ["forward"])
+check("反向 = 1 段（反向）", laser_sweep._direction_phases("reverse") == ["reverse"])
+check("先正后反 = 正向 → 反向",
+      laser_sweep._direction_phases("forward_reverse") == ["forward", "reverse"])
+check("先反后正 = 反向 → 正向",
+      laser_sweep._direction_phases("reverse_forward") == ["reverse", "forward"])
+check("认不出的方向按正向处理（有日志告警，不会静默乱跑）",
+      laser_sweep._direction_phases("斜着扫") == ["forward"])
+
+# ── 参数序列：反向必须与正向严格倒序（同一组点，只是顺序相反）──────────────
+asc_values = laser_sweep._build_phase_values(20, 30, 1, None, "forward")
+rev_values = laser_sweep._build_phase_values(20, 30, 1, None, "reverse")
+check("正向序列从小到大", asc_values == [str(v) for v in range(20, 31)], str(asc_values))
+check("反向序列从大到小", rev_values == list(reversed(asc_values)), str(rev_values))
+check("正反两段是同一组点（严格一一对照）", list(reversed(rev_values)) == asc_values)
+odd_asc = laser_sweep._build_phase_values(20, 30, 1, 4, "forward")
+odd_rev = laser_sweep._build_phase_values(20, 30, 1, 4, "reverse")
+check("点数模式（除不尽）反向也不改变点集",
+      odd_rev == list(reversed(odd_asc)) and sorted(odd_rev) == sorted(odd_asc),
+      f"{odd_asc} / {odd_rev}")
+
+# ── 文件名方向标记 ────────────────────────────────────────────────────────
+check("默认名加方向标记：…_正向.csv",
+      laser_sweep._append_direction_marker("20261030_200000_20_30_11.csv", "forward")
+      == "20261030_200000_20_30_11_正向.csv")
+check("反向标记：…_反向.csv",
+      laser_sweep._append_direction_marker("结果.csv", "reverse") == "结果_反向.csv")
+check("没有方向时文件名不变（老调用方/自检兼容）",
+      laser_sweep._append_direction_marker("结果.csv", None) == "结果.csv")
+check("用户已经写了标记不会重复叠加",
+      laser_sweep._append_direction_marker("结果_正向.csv", "forward") == "结果_正向.csv"
+      and laser_sweep._append_direction_marker("结果_正向.csv", "reverse") == "结果_反向.csv")
+check("拆标记：基础名 + 方向",
+      laser_sweep._split_direction_marker("20261030_200000_20_30_11_反向")
+      == ("20261030_200000_20_30_11", "reverse"))
+check("没有标记时拆出 (原名, None)",
+      laser_sweep._split_direction_marker("普通结果") == ("普通结果", None))
+
+check("方向说明：单方向带区间",
+      laser_sweep._direction_plan_text("reverse", 20.0, 30.0) == "反向（30 → 20）",
+      laser_sweep._direction_plan_text("reverse", 20.0, 30.0))
+check("方向说明：两段按执行顺序写清两段",
+      "正向 20 → 30" in laser_sweep._direction_plan_text("forward_reverse", 20.0, 30.0)
+      and "再反向 30 → 20" in laser_sweep._direction_plan_text("forward_reverse", 20.0, 30.0),
+      laser_sweep._direction_plan_text("forward_reverse", 20.0, 30.0))
+
+
+# ── 方向来源优先级：方向节点 > 节点参数 > 框架节点数据 > 默认正向 ──────────
+class _DirCtx:
+    """假的 Context.get_node_data。
+
+    ⚠️ MaaFramework 5.x 实际返回的是 **V2 嵌套格式**（action.param...）；
+    2026-10-30 之前的兜底只认 V1 扁平格式，实测永远读不到 —— 这里两种都造出来测。
+    """
+
+    def __init__(self, direction, v2=True):
+        self.direction = direction
+        self.v2 = v2
+
+    def get_node_data(self, _name):
+        if self.direction is None:
+            return None
+        if self.v2:
+            return {
+                "action": {
+                    "type": "Custom",
+                    "param": {
+                        "custom_action": "laser_sweep_direction",
+                        "custom_action_param": {"direction": self.direction},
+                    },
+                }
+            }
+        return {"custom_action_param": {"direction": self.direction}}
+
+
+# _resolve_direction 的最后一层会读真实 MFA 配置；自检里桩掉保证可复现
+_real_task_direction = laser_sweep._load_direction_from_task_config
+laser_sweep._load_direction_from_task_config = lambda: None
+
+laser_sweep._state.update(pending_direction="reverse")
+check("方向节点暂存的值优先",
+      laser_sweep._resolve_direction(_DirCtx("forward"), {"direction": "forward"}) == "reverse")
+laser_sweep._state.update(pending_direction=None)
+check("没有暂存时用本节点参数",
+      laser_sweep._resolve_direction(_DirCtx("reverse"), {"direction": "forward"}) == "forward")
+check("都没有时问框架要方向节点参数（V2 嵌套格式，MaaFramework 5.x 实际返回）",
+      laser_sweep._resolve_direction(_DirCtx("reverse"), {}) == "reverse")
+check("框架返回 V1 扁平格式也兼容（老框架 / 自检桩）",
+      laser_sweep._resolve_direction(_DirCtx("forward", v2=False), {}) == "forward")
+check("框架也读不到时默认正向（会打告警日志）",
+      laser_sweep._resolve_direction(_DirCtx(None), {}) == "forward")
+laser_sweep._load_direction_from_task_config = _real_task_direction
+
+# 任务配置兜底：MFA 实例配置可能保存 select 的选中 case（老 entry 场景）
+check("任务配置 selected_cases 能读出方向",
+      laser_sweep._extract_direction_from_task(
+          {"TaskItems": [{"name": "激光参数扫描", "option": [{"name": "扫描方向", "selected_cases": ["反向"]}]}]}
+      ) == "reverse")
+check("任务配置 data 字符串能读出方向",
+      laser_sweep._extract_direction_from_task(
+          {"task": [{"name": "激光参数扫描", "option": [{"name": "扫描方向", "data": "先正后反"}]}]}
+      ) == "forward_reverse")
+check("老版 option 字典布局也能读出方向",
+      laser_sweep._extract_direction_from_task(
+          {"task": [{"name": "激光参数扫描", "option": {"扫描方向": "反向"}}]}
+      ) == "reverse")
+check("「扫描方向」嵌在「扫描设置」的 sub_options 里也能读出",
+      laser_sweep._extract_direction_from_task(
+          {"TaskItems": [{"name": "激光参数扫描", "option": [
+              {"name": "扫描设置", "sub_options": [
+                  {"name": "扫描方向", "selected_cases": ["先反后正"]},
+              ]}
+          ]}]}
+      ) == "reverse_forward")
+_split_root = {
+    "TaskItems": [{"name": "激光参数扫描", "option": [
+        {"name": "扫描设置", "sub_options": [
+            {"name": "扫描设置项", "data": {
+                "起始值": "25", "结束值": "35", "步长": "2",
+                "扫描点数": "0", "等待秒数": "8",
+            }},
+            {"name": "扫描输出项", "data": {
+                "结果文件夹名": "myrun", "结果文件名": "r.csv",
+                "跑完自动打开": "false", "输出总目录": "D:\\out",
+            }},
+        ]},
+    ]}]
+}
+_split_settings = laser_sweep._extract_scan_task_settings(_split_root)
+check("拆分后的「扫描范围项 + 扫描输出项」能一起从任务配置读出",
+      _split_settings == [{
+          "start": "25", "end": "35", "step": "2", "count": "0", "wait_sec": "8",
+          "csv_dir": "myrun", "csv_name": "r.csv",
+          "open_when_done": "false", "output_root": "D:\\out",
+      }], str(_split_settings))
+
+_saved_scan_loader = laser_sweep._load_scan_settings_from_task
+laser_sweep._load_scan_settings_from_task = lambda: dict(_split_settings[0])
+try:
+    _merged_settings = laser_sweep._merge_scan_settings_from_task({"start": "20", "end": "21"})
+finally:
+    laser_sweep._load_scan_settings_from_task = _saved_scan_loader
+check("begin 的合并逻辑能从拆分后的任务配置补回输出字段",
+      _merged_settings.get("csv_dir") == "myrun"
+      and _merged_settings.get("csv_name") == "r.csv"
+      and _merged_settings.get("output_root") == "D:\\out"
+      and _merged_settings.get("open_when_done") == "false",
+      str(_merged_settings))
+
+# ── 两段切换：真的建第二份 CSV、组号回到 1、第一份不丢 ─────────────────────
+_TMP_DIR = WORKSPACE / "debug" / "_check_pickers_tmp"
+_TMP_DIR.mkdir(parents=True, exist_ok=True)
+# 切段时会通过 _remember_output_root 落盘运行状态；指到临时目录，
+# 别把用户真实的 laser_sweep_output.json 覆盖成测试路径。
+_real_state_file = laser_sweep._state_file
+laser_sweep._state_file = lambda: _TMP_DIR / "laser_sweep_output.json"
+_phase1_csv = _TMP_DIR / "case_1_正向.csv"
+_phase2_csv = _TMP_DIR / "case_1_反向.csv"
+_phase1_csv.write_text("序号,设定参数,B软件测量值,时间,备注\n1,20,-79.7,t,\n", encoding="utf-8-sig")
+_phase2_csv.unlink(missing_ok=True)
+
+laser_sweep._state.update(
+    direction="forward_reverse",
+    direction_label="先正后反",
+    phases=[
+        {"code": "forward", "label": "正向", "values": ["20", "21"], "csv_path": _phase1_csv, "started": True},
+        {"code": "reverse", "label": "反向", "values": ["21", "20"], "csv_path": _phase2_csv, "started": False},
+    ],
+    phase_index=0,
+    values=["20", "21"],
+    index=1,
+    csv_path=_phase1_csv,
+    csv_paths=[_phase1_csv],
+    csv_header=["序号", "设定参数", "B软件测量值", "时间", "备注"],
+    out_root=_TMP_DIR,
+    guard={"strikes": 3, "abnormal": [-95.0], "reference": -79.7},
+    sample_failures={"ocr": 2},
+    last_note="旧备注",
+    measured=-79.7,
+)
+
+class _AdvCtx:
+    def __init__(self):
+        self.next_calls = []
+
+    def override_next(self, node, next_list):
+        self.next_calls.append((node, list(next_list)))
+        return True
+
+
+_adv_ctx = _AdvCtx()
+_adv_argv = type("_Arg", (), {"node_name": "LaserSweepAdvance", "custom_action_param": {}})()
+laser_sweep.LaserSweepAdvance().run(_adv_ctx, _adv_argv)
+check("第一段跑完 → 切到第二段（不改道 Done）", _adv_ctx.next_calls == [], str(_adv_ctx.next_calls))
+check("第二段 CSV 已建好且写了表头",
+      _phase2_csv.is_file() and _phase2_csv.read_text(encoding="utf-8-sig").splitlines()[0].startswith("序号"),
+      str(_phase2_csv))
+check("组号回到第 1 组、当前文件切换到第二份",
+      laser_sweep._state["index"] == 0
+      and laser_sweep._state["phase_index"] == 1
+      and laser_sweep._state["values"] == ["21", "20"]
+      and laser_sweep._state["csv_path"] == _phase2_csv)
+check("csv_paths 记下两份（绘图任务要用）",
+      laser_sweep._state["csv_paths"] == [_phase1_csv, _phase2_csv],
+      str(laser_sweep._state["csv_paths"]))
+check("每段的重测计数清零、可信基准保留",
+      laser_sweep._state["guard"]["strikes"] == 0
+      and laser_sweep._state["guard"]["abnormal"] == []
+      and laser_sweep._state["guard"]["reference"] == -79.7)
+check("每段的备注/当轮读数被清干净",
+      laser_sweep._state["last_note"] == "" and laser_sweep._state["measured"] is None)
+
+# 第二段跑完 → 没有下一段，改道 Done
+laser_sweep._state["index"] = len(laser_sweep._state["values"]) - 1
+_adv_ctx2 = _AdvCtx()
+laser_sweep.LaserSweepAdvance().run(_adv_ctx2, _adv_argv)
+check("两段都跑完 → 改道 Done",
+      _adv_ctx2.next_calls == [("LaserSweepAdvance", ["LaserSweepDone"])],
+      str(_adv_ctx2.next_calls))
+
+# 收尾日志要能看到两份文件（这里只验证状态字段齐全，日志由人工看）
+check("收尾能拿到两份 CSV 与计划总数",
+      len(laser_sweep._state["csv_paths"]) == 2 and laser_sweep._planned_total() == 4,
+      f"{laser_sweep._state['csv_paths']} / {laser_sweep._planned_total()}")
+
+# ── 第二段 CSV 建不出来：不能谎报"全部完成"（2026-10-30 审查指出）──────────
+_blocked = _TMP_DIR / "blocked"
+_blocked.write_text("这是一个文件，不是文件夹", encoding="utf-8")
+laser_sweep._state.update(
+    phases=[
+        {"code": "forward", "label": "正向", "values": ["20"], "csv_path": _phase1_csv, "started": True},
+        {"code": "reverse", "label": "反向", "values": ["20"], "csv_path": _blocked / "x.csv", "started": False},
+    ],
+    phase_index=0,
+    values=["20"],
+    index=0,
+    csv_path=_phase1_csv,
+    csv_paths=[_phase1_csv],
+    csv_header=["序号", "设定参数", "B软件测量值", "时间", "备注"],
+    out_root=_TMP_DIR,
+    guard={"strikes": 0, "abnormal": [], "reference": None},
+    sample_failures={},
+    measured=None,
+    last_note="",
+    run_start=time.monotonic(),
+    started_at="2026-10-30 22:00:00",
+)
+_ok_next = laser_sweep._start_next_phase()
+check("第二段结果文件建不出来 → _start_next_phase 返回 False", _ok_next is False)
+check("失败会记下 phase_failed（供收尾日志区分）",
+      isinstance(laser_sweep._state.get("phase_failed"), dict),
+      str(laser_sweep._state.get("phase_failed")))
+check("失败时第二段没被标记为 started",
+      laser_sweep._state["phases"][1]["started"] is False)
+check("失败时 csv_paths 不混入未开始的文件",
+      laser_sweep._state["csv_paths"] == [_phase1_csv],
+      str(laser_sweep._state["csv_paths"]))
+
+_fail_ctx = _AdvCtx()
+_fail_out = io.StringIO()
+with contextlib.redirect_stdout(_fail_out):
+    laser_sweep.LaserSweepAdvance().run(_fail_ctx, _adv_argv)
+_fail_text = _fail_out.getvalue()
+check("失败收尾日志不谎报『已完成全部』",
+      "已完成全部" not in _fail_text and "没能开始" in _fail_text, _fail_text[-200:])
+check("失败收尾日志报出「已完成 1 组 / 计划 2 组」",
+      "已完成 1 组 / 计划 2 组" in _fail_text, _fail_text[-200:])
+check("失败后仍改道 Done",
+      _fail_ctx.next_calls == [("LaserSweepAdvance", ["LaserSweepDone"])],
+      str(_fail_ctx.next_calls))
+
+_fail_summary = laser_sweep._compose_summary(state=laser_sweep._state)
+check("摘要不会给未开始的段列参数区间",
+      "参数区间（反向）" not in _fail_summary["body"], _fail_summary["body"][:200])
+check("摘要明确标出「未开始的段」",
+      "未开始的段" in _fail_summary["body"] and "反向" in _fail_summary["body"],
+      _fail_summary["body"][:200])
+
+# 恢复真实状态文件函数，再清理临时产物
+laser_sweep._state_file = _real_state_file
+for _path in (_phase1_csv, _phase2_csv, _blocked, _TMP_DIR / "laser_sweep_output.json"):
+    _path.unlink(missing_ok=True)
+try:
+    _TMP_DIR.rmdir()
+except OSError:
+    pass
+
+print()
+print("=" * 78)
+print("⑫ 整条开工链路：方向节点 → begin → 两段 → 收尾/摘要（2026-10-30）")
+print("=" * 78)
+
+
+class _BeginCtx:
+    """够 begin / advance / finish 用的假 Context（不连框架、不动真文件）。"""
+
+    class _Controller:
+        pass
+
+    class _Tasker:
+        def __init__(self):
+            self.controller = _BeginCtx._Controller()
+
+    def __init__(self):
+        self.tasker = self._Tasker()
+        self.pipeline_calls = []
+        self.next_calls = []
+
+    def override_pipeline(self, data):
+        self.pipeline_calls.append(data)
+        return True
+
+    def override_next(self, node, next_list):
+        self.next_calls.append((node, list(next_list)))
+        return True
+
+    def get_node_data(self, _name):
+        return None
+
+
+class _BeginArg:
+    def __init__(self, param, node="LaserSweepBegin"):
+        self.custom_action_param = json.dumps(param, ensure_ascii=False)
+        self.node_name = node
+
+
+_BEGIN_TMP = WORKSPACE / "debug" / "_check_pickers_begin"
+_BEGIN_TMP.mkdir(parents=True, exist_ok=True)
+_saved_state = dict(laser_sweep._state)
+_saved_funcs = {
+    "_merge_scan_settings_from_task": laser_sweep._merge_scan_settings_from_task,
+    "_load_mail_settings_from_email_task": laser_sweep._load_mail_settings_from_email_task,
+    "_state_file": laser_sweep._state_file,
+    "_open_folder": laser_sweep._open_folder,
+}
+try:
+    # 隔离掉真实任务配置 / 真实状态文件 / 真实资源管理器窗口
+    laser_sweep._merge_scan_settings_from_task = (
+        lambda p: (laser_sweep._state.__setitem__("scan_settings_from_task", False) or p)
+    )
+    laser_sweep._load_mail_settings_from_email_task = lambda: {}
+    laser_sweep._state_file = lambda: _BEGIN_TMP / "laser_sweep_output.json"
+    laser_sweep._open_folder = lambda _path: True
+
+    _dir_ctx = _BeginCtx()
+    laser_sweep._state["pending_direction"] = None
+    laser_sweep.LaserSweepDirection().run(
+        _dir_ctx, _BeginArg({"direction": "forward_reverse"}, "LaserSweepDirection")
+    )
+    check("方向节点把选中的方向暂存进 _state",
+          laser_sweep._state.get("pending_direction") == "forward_reverse",
+          str(laser_sweep._state.get("pending_direction")))
+
+    _begin_ctx = _BeginCtx()
+    _begin_ok = laser_sweep.LaserSweepBegin().run(
+        _begin_ctx,
+        _BeginArg(
+            {
+                "start": 20,
+                "end": 30,
+                "step": 1,
+                "count": 0,
+                "wait_sec": 0,
+                "csv_dir": "",
+                "csv_name": "",
+                "output_root": str(_BEGIN_TMP / "output"),
+                "open_when_done": False,
+            }
+        ),
+    )
+    check("begin 成功（方向节点 → begin 链路通）", _begin_ok is True, str(_begin_ok))
+    _phases = laser_sweep._state["phases"]
+    check("先正后反 = 计划两段", len(_phases) == 2, str(len(_phases)))
+    check("第一段 CSV 已建好并有表头",
+          _phases[0]["csv_path"].is_file()
+          and _phases[0]["csv_path"].read_text(encoding="utf-8-sig").startswith("序号"),
+          str(_phases[0]["csv_path"]))
+    check("第二段 CSV 先不创建（等第一段跑完）", not _phases[1]["csv_path"].exists())
+    check("两段落在同一文件夹、基础名相同（只差方向标记）",
+          _phases[0]["csv_path"].parent == _phases[1]["csv_path"].parent
+          and _phases[0]["csv_path"].name
+          == _phases[1]["csv_path"].name.replace("_反向", "_正向"),
+          f"{_phases[0]['csv_path']} / {_phases[1]['csv_path']}")
+    check("第一段序列正向 20 → 30",
+          laser_sweep._state["values"][0] == "20"
+          and laser_sweep._state["values"][-1] == "30",
+          f"{laser_sweep._state['values'][0]}..{laser_sweep._state['values'][-1]}")
+    check("计划总组数 = 11 + 11 = 22", laser_sweep._planned_total() == 22,
+          str(laser_sweep._planned_total()))
+    check("方向暂存已被 begin 消费掉（不留到下一次）",
+          laser_sweep._state["pending_direction"] is None)
+    _state_json = json.loads(laser_sweep._state_file().read_text(encoding="utf-8"))
+    check("开工时状态文件记录第一段 CSV（绘图任务用）",
+          _state_json.get("csv_paths") == [str(_phases[0]["csv_path"])],
+          str(_state_json.get("csv_paths")))
+
+    # 第一段：逐点写 11 行，然后推进 → 自动切第二段
+    for _i in range(len(laser_sweep._state["values"])):
+        laser_sweep._state["index"] = _i
+        laser_sweep._append_row(-79.50 + _i * 0.01)
+    laser_sweep.LaserSweepAdvance().run(
+        _BeginCtx(), _BeginArg({}, "LaserSweepAdvance")
+    )
+    check("第一段跑完后自动切到第二段",
+          laser_sweep._state["phase_index"] == 1
+          and laser_sweep._state["index"] == 0
+          and laser_sweep._state["csv_path"] == _phases[1]["csv_path"],
+          f"phase={laser_sweep._state['phase_index']} index={laser_sweep._state['index']}")
+    check("第二段序列反向 30 → 20",
+          laser_sweep._state["values"][0] == "30"
+          and laser_sweep._state["values"][-1] == "20",
+          f"{laser_sweep._state['values'][0]}..{laser_sweep._state['values'][-1]}")
+    check("两段 CSV 都进了 csv_paths",
+          laser_sweep._state["csv_paths"] == [_phases[0]["csv_path"], _phases[1]["csv_path"]],
+          str(laser_sweep._state["csv_paths"]))
+
+    # 第二段：逐点写 11 行，然后推进 → 收尾
+    for _i in range(len(laser_sweep._state["values"])):
+        laser_sweep._state["index"] = _i
+        laser_sweep._append_row(-79.60 + _i * 0.01)
+    _finish_ctx = _BeginCtx()
+    laser_sweep.LaserSweepAdvance().run(_finish_ctx, _BeginArg({}, "LaserSweepAdvance"))
+    check("两段都跑完才改道 Done",
+          _finish_ctx.next_calls == [("LaserSweepAdvance", ["LaserSweepDone"])],
+          str(_finish_ctx.next_calls))
+
+    # 两份 CSV 的行数 / 序号 / 设定值顺序都要对
+    _rows1 = [
+        line.split(",")
+        for line in _phases[0]["csv_path"].read_text(encoding="utf-8-sig").strip().splitlines()
+    ]
+    _rows2 = [
+        line.split(",")
+        for line in _phases[1]["csv_path"].read_text(encoding="utf-8-sig").strip().splitlines()
+    ]
+    check("第一段 CSV = 表头 + 11 行", len(_rows1) == 12, str(len(_rows1)))
+    check("第一段设定值 20 → 30",
+          len(_rows1) == 12 and _rows1[1][1] == "20" and _rows1[-1][1] == "30")
+    check("第二段 CSV = 表头 + 11 行", len(_rows2) == 12, str(len(_rows2)))
+    check("第二段设定值 30 → 20",
+          len(_rows2) == 12 and _rows2[1][1] == "30" and _rows2[-1][1] == "20")
+    check("两份 CSV 各自从序号 1 开始",
+          len(_rows1) == 12 and len(_rows2) == 12
+          and _rows1[1][0] == "1" and _rows2[1][0] == "1")
+
+    _finish_ok = laser_sweep.LaserSweepFinish().run(
+        _BeginCtx(), _BeginArg({"open_when_done": False}, "LaserSweepDone")
+    )
+    check("收尾成功（open_when_done=false 时不开文件夹）", _finish_ok is True)
+    _state_json = json.loads(laser_sweep._state_file().read_text(encoding="utf-8"))
+    check("收尾后状态文件同时记着两份 CSV",
+          _state_json.get("csv_paths") == [str(_phases[0]["csv_path"]), str(_phases[1]["csv_path"])]
+          and _state_json.get("last_csv") == str(_phases[1]["csv_path"]),
+          str(_state_json))
+
+    # 完成摘要要能看出「两段 / 两份文件 / 总组数」
+    _summary = laser_sweep._compose_summary(state=laser_sweep._state)
+    check("完成摘要写明扫描方向",
+          "扫描方向：先正后反" in _summary["body"], _summary["body"][:120])
+    check("完成摘要列出两份结果文件",
+          _phases[0]["csv_path"].name in _summary["body"]
+          and _phases[1]["csv_path"].name in _summary["body"], "见摘要【文件】段")
+    check("完成摘要按两段报进度（已记录 22 行）",
+          "计划 22 组" in _summary["summary"] and "已记录 22 行" in _summary["summary"],
+          _summary["summary"])
+
+    # 用这次真跑出来的两份 CSV 走一遍绘图任务：两张图都要有
+    # （check_pickers 没有把 agent/ 加进 sys.path，这里显式加载并注册绘图模块）
+    _plot_spec = importlib.util.spec_from_file_location(
+        "plot_curve", WORKSPACE / "agent" / "plot_curve.py"
+    )
+    _plot_mod = importlib.util.module_from_spec(_plot_spec)
+    # 先注册再执行：plot_curve 里用了 @dataclass，dataclasses 会从 sys.modules
+    # 里按 cls.__module__ 反查模块，没注册就会 AttributeError: 'NoneType'
+    sys.modules["plot_curve"] = _plot_mod
+    _plot_spec.loader.exec_module(_plot_mod)
+    _plot_csvs = laser_sweep._resolve_plot_csvs({})
+    check("绘图任务能从本次扫描拿到两份 CSV",
+          _plot_csvs == [_phases[0]["csv_path"], _phases[1]["csv_path"]], str(_plot_csvs))
+    _plot_ok = laser_sweep.LaserSweepPlotCurve().run(
+        None,
+        _BeginArg(
+            {"source_csv": "", "image_name": "", "open_when_done": False},
+            "LaserSweepPlotCurve",
+        ),
+    )
+    _img1 = _plot_mod.default_image_path(_phases[0]["csv_path"])
+    _img2 = _plot_mod.default_image_path(_phases[1]["csv_path"])
+    check("两段扫描后，绘图任务成功", _plot_ok is True, str(_plot_ok))
+    check("正/反两份 CSV 各生成一张图", _img1.is_file() and _img2.is_file(),
+          f"{_img1.name} / {_img2.name}")
+
+    # 再跑一次「反向」单方向：1 段、1 份 CSV、序列 30 → 20
+    laser_sweep._state["pending_direction"] = None
+    laser_sweep.LaserSweepDirection().run(
+        _BeginCtx(), _BeginArg({"direction": "reverse"}, "LaserSweepDirection")
+    )
+    _rev_ok = laser_sweep.LaserSweepBegin().run(
+        _BeginCtx(),
+        _BeginArg(
+            {
+                "start": 20,
+                "end": 30,
+                "step": 1,
+                "count": 0,
+                "wait_sec": 0,
+                "csv_dir": "single_reverse",
+                "csv_name": "",
+                "output_root": str(_BEGIN_TMP / "output"),
+                "open_when_done": False,
+            }
+        ),
+    )
+    _rev_path = laser_sweep._state["phases"][0]["csv_path"]
+    check("反向单扫：begin 成功且只计划 1 段",
+          _rev_ok is True and len(laser_sweep._state["phases"]) == 1,
+          str(len(laser_sweep._state["phases"])))
+    check("反向单扫：文件名带 _反向",
+          _rev_path.name.endswith("_反向.csv"), _rev_path.name)
+    check("反向单扫：序列 30 → 20",
+          laser_sweep._state["values"][0] == "30"
+          and laser_sweep._state["values"][-1] == "20",
+          f"{laser_sweep._state['values'][0]}..{laser_sweep._state['values'][-1]}")
+    check("反向单扫：csv_paths 只有一份",
+          laser_sweep._state["csv_paths"] == [_rev_path],
+          str(laser_sweep._state["csv_paths"]))
+finally:
+    laser_sweep._state.clear()
+    laser_sweep._state.update(_saved_state)
+    for _name, _func in _saved_funcs.items():
+        setattr(laser_sweep, _name, _func)
+    import shutil as _shutil
+
+    _shutil.rmtree(_BEGIN_TMP, ignore_errors=True)
 
 print()
 print("=" * 78)

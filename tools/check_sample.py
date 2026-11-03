@@ -627,8 +627,7 @@ check("没有任何节点被两个 option 同时覆盖（否则字段会被整�
 _start_ov = (interface["option"]["扫描设置项"].get("pipeline_override") or {}).get(
     "LaserSweepStart", {}
 ).get("custom_action_param", {})
-_scan_fields = ("start", "end", "step", "count", "wait_sec",
-                "csv_dir", "csv_name", "open_when_done", "csv_header")
+_scan_fields = ("start", "end", "step", "count", "wait_sec", "csv_header")
 _missing_scan = [k for k in _scan_fields if k not in _start_ov]
 check("扫描参数（起止/步长/点数…）都在 LaserSweepStart 的覆盖块里",
       _missing_scan == [], str(_missing_scan))
@@ -638,6 +637,72 @@ check("结束值确实来自界面占位符", _start_ov.get("end") == "{结束�
 check("步长确实来自界面占位符", _start_ov.get("step") == "{步长}", str(_start_ov.get("step")))
 check("扫描点数确实来自界面占位符", _start_ov.get("count") == "{扫描点数}",
       str(_start_ov.get("count")))
+# 2026-10-30：方向/输出都拆出去了，Start 只引用本 option 的字段（MFA 占位符
+# 只按当前 option 的 inputs 替换，跨 option 的 {结果文件夹名} 不会被替换）。
+check("LaserSweepStart 覆盖块里没有 direction（方向走独立节点）",
+      "direction" not in _start_ov, str(sorted(_start_ov)))
+check("LaserSweepStart 覆盖块里不引用输出字段（避免跨 option 占位符不生效）",
+      all(key not in _start_ov for key in ("csv_dir", "csv_name", "output_root", "open_when_done")),
+      str(sorted(_start_ov)))
+
+# ── 扫描输出项（2026-10-30 从扫描设置项拆出）──────────────────────────────
+_output_opt = interface["option"].get("扫描输出项") or {}
+_output_inputs = {i.get("name") for i in (_output_opt.get("inputs") or [])}
+check("「扫描输出项」包含结果文件夹名/结果文件名/跑完自动打开/输出总目录",
+      _output_inputs == {"结果文件夹名", "结果文件名", "跑完自动打开", "输出总目录"},
+      str(sorted(_output_inputs)))
+_output_ov = (_output_opt.get("pipeline_override") or {})
+_done_ov = (_output_ov.get("LaserSweepDone") or {}).get("custom_action_param") or {}
+_open_ov = (_output_ov.get("LaserSweepOpenOutput") or {}).get("custom_action_param") or {}
+check("输出项覆盖 LaserSweepDone / LaserSweepOpenOutput（各自引用本 option 字段）",
+      _done_ov.get("open_when_done") == "{跑完自动打开}"
+      and _open_ov.get("csv_dir") == "{结果文件夹名}"
+      and _open_ov.get("output_root") == "{输出总目录}",
+      f"{_done_ov} / {_open_ov}")
+check("输出项不覆盖 LaserSweepStart（避免两处抢同一个 custom_action_param）",
+      "LaserSweepStart" not in _output_ov, str(sorted(_output_ov)))
+
+# ── 扫描方向（2026-10-30 新增）────────────────────────────────────────────
+_scan_task_entry = next(t for t in interface["task"] if t["name"] == "激光参数扫描").get("entry")
+check("扫描任务入口是「扫描方向」节点", _scan_task_entry == "LaserSweepDirection",
+      str(_scan_task_entry))
+_direction_opt = interface["option"].get("扫描方向") or {}
+check("「扫描方向」是下拉框（select）",
+      _direction_opt.get("type") == "select", str(_direction_opt.get("type")))
+_direction_cases = _direction_opt.get("cases") or []
+_direction_names = [c.get("name") for c in _direction_cases if isinstance(c, dict)]
+check("扫描方向有四个选项：正向 / 反向 / 先正后反 / 先反后正",
+      _direction_names == ["正向", "反向", "先正后反", "先反后正"], str(_direction_names))
+check("扫描方向默认选「正向」", _direction_opt.get("default_case") == "正向",
+      str(_direction_opt.get("default_case")))
+_pipe_direction = pipeline.get("LaserSweepDirection") or {}
+_pipe_direction_param = _pipe_direction.get("custom_action_param") or {}
+check("pipeline 里有方向节点、默认 forward",
+      _pipe_direction.get("custom_action") == "laser_sweep_direction"
+      and _pipe_direction_param.get("direction") == "forward",
+      str(_pipe_direction))
+check("方向节点先于 begin 运行（next = LaserSweepStart）",
+      _pipe_direction.get("next") == ["LaserSweepStart"], str(_pipe_direction.get("next")))
+_expected_codes = ["forward", "reverse", "forward_reverse", "reverse_forward"]
+_bad_direction_cases = []
+for _case, _code in zip(_direction_cases, _expected_codes):
+    _case_override = (_case.get("pipeline_override") or {}).get("LaserSweepDirection") or {}
+    _case_param = _case_override.get("custom_action_param") or {}
+    if _case_param.get("direction") != _code or set(_case_param) != {"direction"}:
+        _bad_direction_cases.append((_case.get("name"), _case_param))
+check("四个 case 分别把方向映射到标准代码（且只带 direction）",
+      _bad_direction_cases == [], str(_bad_direction_cases))
+check("四个 case 都只覆盖 LaserSweepDirection 一个节点",
+      all(set((c.get("pipeline_override") or {})) == {"LaserSweepDirection"}
+          for c in _direction_cases),
+      str([sorted((c.get("pipeline_override") or {})) for c in _direction_cases]))
+check("扫描设置项不覆盖方向节点（两处各管一边）",
+      "LaserSweepDirection" not in
+      ((interface["option"]["扫描设置项"].get("pipeline_override") or {})))
+check("方向 option / case 都不覆盖 LaserSweepStart（不抢扫描参数）",
+      "LaserSweepStart" not in (_direction_opt.get("pipeline_override") or {})
+      and all("LaserSweepStart" not in (c.get("pipeline_override") or {})
+              for c in _direction_cases))
 
 # 2026-10-28：主任务不再写任何邮件字段，邮件配置只在「邮件通知」任务里维护。
 _mail_fields = ("smtp_host", "smtp_user", "smtp_password", "mail_to",
@@ -653,10 +718,16 @@ check("扫描任务挂的是「扫描设置 / 读数校验 / 读数采样」",
       _scan_opts == ["扫描设置", "读数校验", "读数采样"], str(_scan_opts))
 check("扫描任务没有「邮件设置」", "邮件设置" not in _scan_opts, str(_scan_opts))
 _scan_parent = interface["option"]["扫描设置"]
+_scan_case_options = next(
+    (c.get("option") or [] for c in _scan_parent.get("cases", []) if "扫描设置项" in (c.get("option") or [])),
+    [],
+)
 check("「扫描设置」是折叠分组（checkbox + 展开设置按钮）",
-      _scan_parent.get("type") == "checkbox"
-      and any("扫描设置项" in (c.get("option") or []) for c in _scan_parent.get("cases", [])),
+      _scan_parent.get("type") == "checkbox" and "扫描设置项" in _scan_case_options,
       str(_scan_parent.get("type")))
+check("「扫描方向」嵌在「扫描设置」里，且排在「扫描设置项」和「扫描输出项」之间（即结果文件夹名前）",
+      _scan_case_options == ["扫描设置项", "扫描方向", "扫描输出项"],
+      str(_scan_case_options))
 _check_parent = interface["option"]["读数校验"]
 check("「读数校验」是折叠分组（checkbox + 展开设置按钮）",
       _check_parent.get("type") == "checkbox"
@@ -676,12 +747,29 @@ _guard_ov = (interface["option"]["读数校验项"].get("pipeline_override") or 
     "LaserSweepGuard", {}
 ).get("custom_action_param", {})
 _guard_fields = ("enabled", "tolerance_abs", "tolerance_pct", "retry_wait", "retry_max",
-                 "notify_enabled", "continue_on_abnormal")
+                 "notify_enabled", "continue_on_abnormal", "keep_abnormal")
 _missing_guard = [k for k in _guard_fields if k not in _guard_ov]
 check("读数校验的 Guard 覆盖块字段齐全", _missing_guard == [], str(_missing_guard))
 check("读数校验的 Guard 覆盖块没有 smtp 字段",
       not any(k.startswith("smtp_") or k == "mail_to" for k in _guard_ov),
       str([k for k in _guard_ov if k.startswith("smtp_") or k == "mail_to"]))
+
+# 「保留异常读数」开关：界面项、Guard/AbnormalStop/RecordFailed 三个节点都要拿到它。
+_check_inputs = {i["name"] for i in interface["option"]["读数校验项"]["inputs"]}
+check("「保留异常读数」在界面上有对应开关", "保留异常读数" in _check_inputs, str(sorted(_check_inputs)))
+_check_ov = interface["option"]["读数校验项"].get("pipeline_override") or {}
+_stop_ov = (_check_ov.get("LaserSweepAbnormalStop") or {}).get("custom_action_param") or {}
+_failed_ov = (_check_ov.get("LaserSweepRecordFailed") or {}).get("custom_action_param") or {}
+check("AbnormalStop 覆盖块带 keep_abnormal", _stop_ov.get("keep_abnormal") == "{保留异常读数}",
+      str(_stop_ov))
+check("RecordFailed 覆盖块带 keep_abnormal", _failed_ov.get("keep_abnormal") == "{保留异常读数}",
+      str(_failed_ov))
+check("pipeline 默认 keep_abnormal=True（Guard）",
+      pipeline["LaserSweepGuard"]["custom_action_param"].get("keep_abnormal") is True)
+check("pipeline 默认 keep_abnormal=True（AbnormalStop）",
+      pipeline["LaserSweepAbnormalStop"]["custom_action_param"].get("keep_abnormal") is True)
+check("pipeline 默认 keep_abnormal=True（RecordFailed）",
+      pipeline["LaserSweepRecordFailed"]["custom_action_param"].get("keep_abnormal") is True)
 
 # 采样默认值本身也要能过一遍解析，别写出一个认不出来的值
 guard_like = ls._flag(pipeline["LaserSweepReadValueB"]["custom_recognition_param"].get("sample_enabled"), True)
